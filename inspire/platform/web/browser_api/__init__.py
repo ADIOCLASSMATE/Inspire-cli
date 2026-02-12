@@ -17,6 +17,7 @@ from .availability import (
 from .jobs import (
     JobInfo,
     get_current_user,
+    get_train_job_workdir,
     list_job_users,
     list_jobs,
 )
@@ -28,12 +29,22 @@ from .notebooks import (
     get_resource_prices,
     list_images,
     list_notebook_compute_groups,
-    run_command_in_notebook,
-    setup_notebook_rtunnel,
     start_notebook,
     stop_notebook,
     wait_for_notebook_running,
 )
+from .playwright_notebooks import run_command_in_notebook
+from .images import (
+    CustomImageInfo,
+    create_image,
+    delete_image,
+    get_image_detail,
+    list_images_by_source,
+    list_private_images,
+    save_notebook_as_image,
+    wait_for_image_ready,
+)
+from .rtunnel import setup_notebook_rtunnel
 from .projects import (
     ProjectInfo,
     list_projects,
@@ -44,6 +55,7 @@ __all__ = [
     # Jobs / users
     "JobInfo",
     "get_current_user",
+    "get_train_job_workdir",
     "list_job_users",
     "list_jobs",
     # Availability
@@ -57,6 +69,15 @@ __all__ = [
     "ProjectInfo",
     "list_projects",
     "select_project",
+    # Images
+    "CustomImageInfo",
+    "create_image",
+    "delete_image",
+    "get_image_detail",
+    "list_images_by_source",
+    "list_private_images",
+    "save_notebook_as_image",
+    "wait_for_image_ready",
     # Notebooks
     "ImageInfo",
     "create_notebook",

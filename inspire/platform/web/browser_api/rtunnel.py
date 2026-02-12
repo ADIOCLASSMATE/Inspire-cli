@@ -1,0 +1,1528 @@
+"""Notebook rtunnel setup: commands, state, probe, verify, and flow.
+
+Merged from the rtunnel subpackage. The public entry point is
+``setup_notebook_rtunnel`` (async-safe wrapper around the sync flow).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from inspire.config.ssh_runtime import (
+    DEFAULT_RTUNNEL_DOWNLOAD_URL,
+    SshRuntimeConfig,
+    resolve_ssh_runtime_config,
+)
+from inspire.platform.web.browser_api.core import (
+    _browser_api_path,
+    _get_base_url,
+    _in_asyncio_loop,
+    _launch_browser,
+    _new_context,
+    _run_in_thread,
+)
+from inspire.bridge.tunnel import load_tunnel_config
+from inspire.platform.web.session import WebSession, build_requests_session, get_web_session
+
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+BOOTSTRAP_SENTINEL = "/tmp/.inspire_rtunnel_bootstrap_v1"
+SETUP_DONE_MARKER = "INSPIRE_RTUNNEL_SETUP_DONE"
+
+
+def build_rtunnel_setup_commands(
+    *,
+    port: int,
+    ssh_port: int,
+    ssh_public_key: Optional[str],
+    ssh_runtime: Optional[SshRuntimeConfig] = None,
+) -> list[str]:
+    import shlex
+
+    if ssh_runtime is None:
+        ssh_runtime = resolve_ssh_runtime_config()
+
+    if ssh_public_key:
+        ssh_public_key_escaped = ssh_public_key.replace("'", "'\"'\"'")
+        key_line = (
+            "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo "
+            f"'{ssh_public_key_escaped}' >> /root/.ssh/authorized_keys && chmod 600 "
+            "/root/.ssh/authorized_keys"
+        )
+    else:
+        key_line = "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+
+    rtunnel_bin = ssh_runtime.rtunnel_bin
+    sshd_deb_dir = ssh_runtime.sshd_deb_dir
+    dropbear_deb_dir = ssh_runtime.dropbear_deb_dir
+    rtunnel_download_url = ssh_runtime.rtunnel_download_url or DEFAULT_RTUNNEL_DOWNLOAD_URL
+
+    cmd_lines = [
+        f"PORT={port}",
+        f"SSH_PORT={ssh_port}",
+        key_line,
+        f"BOOTSTRAP_SENTINEL={BOOTSTRAP_SENTINEL}",
+    ]
+
+    # Always set RTUNNEL_BIN_PATH (empty string if not configured)
+    cmd_lines.append(f"RTUNNEL_BIN_PATH={shlex.quote(rtunnel_bin or '')}")
+    if rtunnel_bin:
+        cmd_lines.append(
+            'if [ -f "$RTUNNEL_BIN_PATH" ]; then cp "$RTUNNEL_BIN_PATH" /tmp/rtunnel '
+            "&& chmod +x /tmp/rtunnel; fi"
+        )
+
+    if sshd_deb_dir:
+        cmd_lines.append(f"SSHD_DEB_DIR={shlex.quote(sshd_deb_dir)}")
+    if dropbear_deb_dir:
+        cmd_lines.append(f"DROPBEAR_DEB_DIR={shlex.quote(dropbear_deb_dir)}")
+
+    openssh_bootstrap_cmd = (
+        'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ] '
+        "|| [ ! -x /usr/sbin/sshd ]; then "
+        'if [ ! -x /usr/sbin/sshd ] && [ -z "${SSHD_DEB_DIR:-}" ]; then '
+        "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && "
+        "apt-get install -y -qq openssh-server; fi; "
+        "RTUNNEL_BIN=/tmp/rtunnel; "
+        'if [ -n "${RTUNNEL_BIN_PATH:-}" ] && [ -x "$RTUNNEL_BIN_PATH" ]; then '
+        'cp "$RTUNNEL_BIN_PATH" /tmp/rtunnel && chmod +x /tmp/rtunnel; fi; '
+        'if [ ! -x "$RTUNNEL_BIN" ]; then curl -fsSL '
+        f"'{rtunnel_download_url}' -o /tmp/rtunnel.tgz && "
+        "tar -xzf /tmp/rtunnel.tgz -C /tmp && chmod +x /tmp/rtunnel "
+        "2>/dev/null; fi; "
+        'if [ -x /usr/sbin/sshd ] && [ -x "$RTUNNEL_BIN" ]; then '
+        'touch "$BOOTSTRAP_SENTINEL"; else rm -f "$BOOTSTRAP_SENTINEL"; fi; fi'
+    )
+    start_sshd_cmd = (
+        'if [ -x /usr/sbin/sshd ] && ! ps -ef | grep -q "[s]shd -p $SSH_PORT"; then '
+        "mkdir -p /run/sshd && chmod 0755 /run/sshd; "
+        "ssh-keygen -A >/dev/null 2>&1 || true; "
+        '/usr/sbin/sshd -p "$SSH_PORT" -o ListenAddress=127.0.0.1 -o PermitRootLogin=yes '
+        "-o PasswordAuthentication=no -o PubkeyAuthentication=yes "
+        ">/dev/null 2>&1 & fi"
+    )
+    start_rtunnel_cmd = (
+        "if [ -x /tmp/rtunnel ] && ! ps -ef | "
+        'grep -Eq "[r]tunnel .*([[:space:]]|:)$PORT([[:space:]]|$)"; then '
+        'nohup /tmp/rtunnel "$SSH_PORT" "$PORT" '
+        ">/tmp/rtunnel-server.log 2>&1 & fi"
+    )
+
+    if dropbear_deb_dir:
+        setup_script = ssh_runtime.setup_script
+        if not setup_script:
+            raise ValueError(
+                "ssh.setup_script (or INSPIRE_SETUP_SCRIPT) is required when using "
+                "ssh.dropbear_deb_dir."
+            )
+        cmd_lines.append(f"SETUP_SCRIPT={shlex.quote(setup_script)}")
+        cmd_lines.append(f"RTUNNEL_URL={rtunnel_download_url!r}")
+        cmd_lines.append(
+            '[ -f "$SETUP_SCRIPT" ] || echo "WARN: setup script not found: $SETUP_SCRIPT '
+            '(falling back to openssh bootstrap)"'
+        )
+        cmd_lines.append(
+            'if [ -f "$SETUP_SCRIPT" ]; then '
+            'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ]; then '
+            'bash "$SETUP_SCRIPT" "$DROPBEAR_DEB_DIR" "$RTUNNEL_BIN_PATH" '
+            '"$SSH_PORT" "$PORT" >/tmp/setup_ssh.log 2>&1; '
+            'if [ $? -eq 0 ] && [ -x /tmp/rtunnel ]; then touch "$BOOTSTRAP_SENTINEL"; '
+            'else rm -f "$BOOTSTRAP_SENTINEL"; fi; fi; '
+            f"else {openssh_bootstrap_cmd}; fi"
+        )
+        cmd_lines.append("tail -40 /tmp/setup_ssh.log 2>/dev/null || true")
+        cmd_lines.append(start_sshd_cmd)
+        cmd_lines.append(start_rtunnel_cmd)
+    else:
+        cmd_lines.extend(
+            [
+                f"RTUNNEL_URL={rtunnel_download_url!r}",
+                openssh_bootstrap_cmd,
+                start_sshd_cmd,
+                start_rtunnel_cmd,
+            ]
+        )
+
+    cmd_lines.append(
+        'if ps -ef | grep -Eq "[r]tunnel .*([[:space:]]|:)$PORT([[:space:]]|$)"; then '
+        'echo "INSPIRE_RTUNNEL_STATUS=running"; '
+        'else echo "INSPIRE_RTUNNEL_STATUS=not_running"; fi'
+    )
+    cmd_lines.append(f"echo {SETUP_DONE_MARKER}")
+
+    return cmd_lines
+
+
+# ============================================================================
+# State
+# ============================================================================
+
+_CACHE_BASENAME = "rtunnel-proxy-state"
+_CACHE_VERSION = 1
+DEFAULT_PROXY_CACHE_TTL_SECONDS = 8 * 60 * 60
+
+
+def _normalize_account(account: Optional[str]) -> Optional[str]:
+    if not account:
+        return None
+    value = account.strip()
+    if not value:
+        return None
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    return normalized or None
+
+
+def _default_cache_dir() -> Path:
+    return Path.home() / ".cache" / "inspire-cli"
+
+
+def get_rtunnel_state_file(
+    *,
+    account: Optional[str],
+    cache_dir: Optional[Path] = None,
+) -> Path:
+    root = cache_dir or _default_cache_dir()
+    normalized = _normalize_account(account)
+    if normalized:
+        return root / f"{_CACHE_BASENAME}-{normalized}.json"
+    return root / f"{_CACHE_BASENAME}.json"
+
+
+def _load_state_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": _CACHE_VERSION, "notebooks": {}}
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return {"version": _CACHE_VERSION, "notebooks": {}}
+    if not isinstance(raw, dict):
+        return {"version": _CACHE_VERSION, "notebooks": {}}
+    notebooks = raw.get("notebooks")
+    if not isinstance(notebooks, dict):
+        notebooks = {}
+    return {"version": raw.get("version", _CACHE_VERSION), "notebooks": notebooks}
+
+
+def _save_state_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, path)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def get_cached_rtunnel_proxy_candidates(
+    *,
+    notebook_id: str,
+    port: int,
+    base_url: str,
+    account: Optional[str],
+    ttl_seconds: int = DEFAULT_PROXY_CACHE_TTL_SECONDS,
+    cache_dir: Optional[Path] = None,
+    now_ts: Optional[float] = None,
+) -> list[str]:
+    state_file = get_rtunnel_state_file(account=account, cache_dir=cache_dir)
+    payload = _load_state_file(state_file)
+    notebooks = payload.get("notebooks", {})
+    entry = notebooks.get(notebook_id)
+    if not isinstance(entry, dict):
+        return []
+
+    proxy_url = str(entry.get("proxy_url") or "").strip()
+    entry_port = int(entry.get("port") or 0)
+    entry_base_url = str(entry.get("base_url") or "").rstrip("/")
+    updated_at = float(entry.get("updated_at") or 0)
+    now = now_ts if now_ts is not None else time.time()
+    if not proxy_url:
+        return []
+    if entry_port and entry_port != port:
+        return []
+    if entry_base_url and entry_base_url != base_url.rstrip("/"):
+        return []
+    if ttl_seconds > 0 and updated_at > 0 and (now - updated_at) > ttl_seconds:
+        return []
+    return [proxy_url]
+
+
+def save_rtunnel_proxy_state(
+    *,
+    notebook_id: str,
+    proxy_url: str,
+    port: int,
+    ssh_port: int,
+    base_url: str,
+    account: Optional[str],
+    cache_dir: Optional[Path] = None,
+    now_ts: Optional[float] = None,
+) -> None:
+    state_file = get_rtunnel_state_file(account=account, cache_dir=cache_dir)
+    payload = _load_state_file(state_file)
+    notebooks = payload.setdefault("notebooks", {})
+    if not isinstance(notebooks, dict):
+        notebooks = {}
+        payload["notebooks"] = notebooks
+
+    notebooks[notebook_id] = {
+        "proxy_url": proxy_url,
+        "port": int(port),
+        "ssh_port": int(ssh_port),
+        "base_url": base_url.rstrip("/"),
+        "updated_at": float(now_ts if now_ts is not None else time.time()),
+    }
+    payload["version"] = _CACHE_VERSION
+    _save_state_file(state_file, payload)
+
+
+# ============================================================================
+# Verify
+# ============================================================================
+
+
+def redact_proxy_url(proxy_url: str) -> str:
+    """Redact sensitive tokens from a notebook proxy URL for logs/errors.
+
+    Proxy URLs may contain tokens either as a path segment:
+      /jupyter/<notebook>/<token>/proxy/<port>/
+    or as a query parameter:
+      .../proxy/<port>/?token=<token>
+    """
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        return proxy_url
+
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        parts = urlsplit(proxy_url)
+        path_segments = parts.path.split("/")
+
+        for marker in ("jupyter", "vscode"):
+            for idx, seg in enumerate(path_segments):
+                if seg != marker:
+                    continue
+                # /<marker>/<notebook>/<token>/proxy/<port>/ -> token is idx+2
+                if idx + 3 < len(path_segments) and path_segments[idx + 3] == "proxy":
+                    if idx + 2 < len(path_segments) and path_segments[idx + 2]:
+                        path_segments[idx + 2] = "<redacted>"
+
+        redacted_path = "/".join(path_segments)
+
+        if parts.query:
+            query_items = parse_qsl(parts.query, keep_blank_values=True)
+            redacted_items = []
+            for key, value in query_items:
+                if key.lower() in {"token", "access_token"}:
+                    redacted_items.append((key, "<redacted>" if value else value))
+                else:
+                    redacted_items.append((key, value))
+            redacted_query = urlencode(redacted_items)
+        else:
+            redacted_query = parts.query
+
+        return urlunsplit(
+            (parts.scheme, parts.netloc, redacted_path, redacted_query, parts.fragment)
+        )
+    except Exception:
+        # Best-effort fallback: redact obvious token query patterns.
+        if "token=" in proxy_url:
+            before, _, after = proxy_url.partition("token=")
+            if "&" in after:
+                _token, _, rest = after.partition("&")
+                return before + "token=<redacted>&" + rest
+            return before + "token=<redacted>"
+        return proxy_url
+
+
+def _is_rtunnel_proxy_ready(*, status: int, body: str) -> bool:
+    text = (body or "").strip().lower()
+
+    if status == 200:
+        if not text:
+            return True
+        if (
+            "econnrefused" in text
+            or "connection refused" in text
+            or "404 page not found" in text
+            or "<html" in text
+            or "<!doctype html" in text
+            or "jupyter server" in text
+        ):
+            return False
+        return True
+
+    # Some deployments return a plain-text 404 from the rtunnel WebSocket server
+    # when probed with an HTTP GET. Treat that as "reachable" to avoid long
+    # waits before SSH preflight.
+    if status == 404 and text and "page not found" in text and "<html" not in text:
+        return True
+
+    return False
+
+
+_TOKEN_QUERY_RE = re.compile(r"(?i)(token=)[^\s&'\"]+")
+_TOKEN_PATH_RE = re.compile(r"(/(?:jupyter|vscode)/[^/]+/)([^/]+)(/proxy/)")
+
+
+def _redact_token_like_text(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return value
+
+    value = _TOKEN_QUERY_RE.sub(r"\1<redacted>", value)
+    value = _TOKEN_PATH_RE.sub(r"\1<redacted>\3", value)
+    return value
+
+
+def _summarize_request_error(error: Exception) -> str:
+    """Return a safe single-line summary for Playwright request errors."""
+    message = str(error).strip()
+    if not message:
+        return error.__class__.__name__
+    headline = message.splitlines()[0].strip()
+    # Avoid Playwright call logs that may include cookies/tokens.
+    return _redact_token_like_text(headline)
+
+
+def wait_for_rtunnel_reachable(
+    *,
+    proxy_url: str,
+    timeout_s: int,
+    context: Any,
+    page: Any,
+) -> None:
+    """Wait until rtunnel becomes reachable via the notebook proxy URL, or raise ValueError."""
+    import sys as _sys
+
+    display_url = redact_proxy_url(proxy_url)
+    _sys.stderr.write(f"  Polling proxy URL: {display_url}\n")
+    _sys.stderr.flush()
+
+    start = time.time()
+    last_status = None
+    last_progress_time = start
+    attempt = 0
+    while time.time() - start < timeout_s:
+        attempt += 1
+        elapsed = time.time() - start
+        if time.time() - last_progress_time >= 30:
+            _sys.stderr.write(f"  Waiting for rtunnel... ({int(elapsed)}s elapsed)\n")
+            _sys.stderr.flush()
+            last_progress_time = time.time()
+        try:
+            resp = context.request.get(proxy_url, timeout=5000)
+            try:
+                body = resp.text()
+            except Exception:
+                body = ""
+            last_status = _redact_token_like_text(f"{resp.status} {body[:200].strip()}")
+            if attempt <= 3:
+                _sys.stderr.write(f"  Attempt {attempt}: {last_status}\n")
+                _sys.stderr.flush()
+            if _is_rtunnel_proxy_ready(status=resp.status, body=body):
+                return
+        except Exception as e:
+            last_status = _summarize_request_error(e)
+            if attempt <= 3:
+                _sys.stderr.write(f"  Attempt {attempt}: {last_status}\n")
+                _sys.stderr.flush()
+
+        elapsed = time.time() - start
+        if elapsed < 3:
+            poll_ms = 180
+        elif elapsed < 8:
+            poll_ms = 300
+        elif elapsed < 20:
+            poll_ms = 650
+        else:
+            poll_ms = 1000
+        page.wait_for_timeout(poll_ms)
+
+    error_msg = (
+        f"rtunnel server did not become reachable within {timeout_s}s.\n"
+        f"Proxy URL: {display_url}\n"
+        f"Last response: {last_status}\n\n"
+        "Debugging hints:\n"
+        "  1. Check if rtunnel binary is present: ls -la /tmp/rtunnel\n"
+        "  2. Check rtunnel server log: cat /tmp/rtunnel-server.log\n"
+        "  3. Check if sshd/dropbear is running: ps aux | grep -E 'sshd|dropbear'\n"
+        "  4. Check dropbear log: cat /tmp/dropbear.log\n"
+        "  5. Try running with --debug-playwright to see the browser\n"
+        "  6. Screenshot saved to /tmp/notebook_terminal_debug.png"
+    )
+    raise ValueError(error_msg)
+
+
+# ============================================================================
+# Probe
+# ============================================================================
+
+_PROXY_PORT_PATTERN = re.compile(r"/proxy/\d+/")
+
+
+def _rewrite_proxy_port(proxy_url: str, port: int) -> str:
+    if f"/proxy/{port}/" in proxy_url:
+        return proxy_url
+    if _PROXY_PORT_PATTERN.search(proxy_url):
+        return _PROXY_PORT_PATTERN.sub(f"/proxy/{port}/", proxy_url, count=1)
+    return proxy_url
+
+
+def _is_reachable_proxy_response(*, status_code: int, body: str) -> bool:
+    text = (body or "").strip().lower()
+
+    if status_code == 200:
+        if "econnrefused" in text or "connection refused" in text:
+            return False
+        if "<html" in text:
+            return False
+        return True
+
+    # The rtunnel WebSocket server may return a plain-text 404 when probed
+    # with an HTTP GET. Treat that as reachable so we can skip Playwright.
+    if status_code == 404 and text and "page not found" in text and "<html" not in text:
+        return True
+
+    return False
+
+
+def _candidate_urls_from_tunnel_config(
+    *,
+    notebook_id: str,
+    port: int,
+    account: Optional[str],
+) -> list[str]:
+    try:
+        config = load_tunnel_config(account=account)
+    except Exception:
+        return []
+
+    candidates: list[str] = []
+    for bridge in config.bridges.values():
+        proxy_url = str(getattr(bridge, "proxy_url", "") or "")
+        if notebook_id not in proxy_url or "/proxy/" not in proxy_url:
+            continue
+        candidates.append(_rewrite_proxy_port(proxy_url, port))
+    return candidates
+
+
+def probe_existing_rtunnel_proxy_url(
+    *,
+    notebook_id: str,
+    port: int,
+    session: WebSession,
+    candidate_urls: Optional[list[str]] = None,
+    account: Optional[str] = None,
+    cache_ttl_seconds: int = DEFAULT_PROXY_CACHE_TTL_SECONDS,
+) -> str | None:
+    """Return the existing proxy URL if it looks reachable (otherwise None)."""
+    base_url = _get_base_url().rstrip("/")
+    notebook_lab_path = _browser_api_path(f"/notebook/lab/{notebook_id}/proxy/{port}/")
+    known_proxy_url = f"{base_url}{notebook_lab_path}"
+
+    resolved_account = account or session.login_username
+    urls: list[str] = [known_proxy_url]
+    if candidate_urls:
+        urls.extend(candidate_urls)
+    urls.extend(
+        get_cached_rtunnel_proxy_candidates(
+            notebook_id=notebook_id,
+            port=port,
+            base_url=base_url,
+            account=resolved_account,
+            ttl_seconds=cache_ttl_seconds,
+        )
+    )
+    urls.extend(
+        _candidate_urls_from_tunnel_config(
+            notebook_id=notebook_id,
+            port=port,
+            account=resolved_account,
+        )
+    )
+    deduped_urls = list(dict.fromkeys(urls))
+
+    http: Optional[object] = None
+    try:
+        http = build_requests_session(session, base_url)
+        for url in deduped_urls:
+            try:
+                resp = http.get(url, timeout=5)  # type: ignore[attr-defined]
+            except Exception:
+                continue
+            body = resp.text[:400] if getattr(resp, "text", "") else ""  # type: ignore[attr-defined]
+            if not _is_reachable_proxy_response(status_code=resp.status_code, body=body):  # type: ignore[attr-defined]
+                continue
+            try:
+                save_rtunnel_proxy_state(
+                    notebook_id=notebook_id,
+                    proxy_url=url,
+                    port=port,
+                    ssh_port=22222,
+                    base_url=base_url,
+                    account=resolved_account,
+                )
+            except Exception:
+                pass
+            return url
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            if http is not None:
+                http.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+# ============================================================================
+# Flow
+# ============================================================================
+
+
+def _timing_enabled() -> bool:
+    value = os.environ.get("INSPIRE_RTUNNEL_TIMING", "")
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
+class _StepTimer:
+    """Lightweight per-step timing collector for the rtunnel setup flow.
+
+    When *enabled* is ``False`` every method is a no-op (zero overhead).
+    """
+
+    def __init__(self, *, enabled: bool = False) -> None:
+        self._enabled = enabled
+        self._steps: list[tuple[str, float]] = []  # (label, elapsed_s)
+        self._last = time.monotonic() if enabled else 0.0
+
+    def mark(self, label: str) -> float:
+        """Record elapsed time since the previous mark.
+
+        Returns the step duration in seconds (0.0 when disabled).
+        """
+        if not self._enabled:
+            return 0.0
+        import sys as _sys
+
+        now = time.monotonic()
+        elapsed = now - self._last
+        self._last = now
+        self._steps.append((label, elapsed))
+        _sys.stderr.write(f"  [timing] {label}: {elapsed:.3f}s\n")
+        _sys.stderr.flush()
+        return elapsed
+
+    def summary(self) -> None:
+        """Print a visual summary table to stderr."""
+        if not self._enabled or not self._steps:
+            return
+        import sys as _sys
+
+        total = sum(s for _, s in self._steps)
+        if total <= 0:
+            return
+
+        max_label = max(len(label) for label, _ in self._steps)
+        bar_width = 30
+
+        _sys.stderr.write("\n  ── rtunnel timing summary ──\n")
+        for label, elapsed in self._steps:
+            pct = elapsed / total * 100
+            bar_len = int(round(pct / 100 * bar_width))
+            bar = "#" * bar_len
+            _sys.stderr.write(f"  {label:<{max_label}}  {elapsed:6.2f}s  {pct:5.1f}%  {bar}\n")
+        _sys.stderr.write(f"  {'TOTAL':<{max_label}}  {total:6.2f}s\n")
+        _sys.stderr.flush()
+
+
+def _jupyter_server_base(lab_url: str) -> str:
+    """Derive the Jupyter server base URL from a lab frame URL.
+
+    Only strips ``/lab`` when it is the **final** path segment (the
+    JupyterLab UI route), not when ``/lab/`` appears mid-path as part
+    of the platform's proxy path (e.g. ``/api/v1/notebook/lab/{id}/``).
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(lab_url)
+    path = parts.path.rstrip("/")
+    if path.endswith("/lab"):
+        path = path[:-4]
+    if not path.endswith("/"):
+        path = path + "/"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _create_terminal_via_api(context: Any, lab_url: str) -> str | None:
+    """Create a JupyterLab terminal via REST API.
+
+    Uses ``context.request`` which shares the browser session's cookies.
+    JupyterLab requires an ``_xsrf`` cookie value in the ``X-XSRFToken``
+    header for state-changing requests.
+    Returns the terminal name (e.g. ``"1"``) on success, or ``None``.
+    """
+    base = _jupyter_server_base(lab_url)
+    api_url = f"{base}api/terminals"
+    try:
+        # JupyterLab XSRF protection: extract _xsrf cookie value
+        headers: dict[str, str] = {}
+        try:
+            for cookie in context.cookies():
+                if cookie.get("name") == "_xsrf":
+                    headers["X-XSRFToken"] = cookie["value"]
+                    break
+        except Exception:
+            pass
+
+        resp = context.request.post(api_url, headers=headers, timeout=10000)
+        if resp.status in (200, 201):
+            data = resp.json()
+            return data.get("name")
+    except Exception:
+        pass
+    return None
+
+
+def _extract_jupyter_token(lab_url: str) -> str | None:
+    from urllib.parse import parse_qs, urlsplit
+
+    parsed = urlsplit(lab_url)
+    query_token = parse_qs(parsed.query).get("token", [None])[0]
+    if query_token:
+        return query_token
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    try:
+        jupyter_index = path_parts.index("jupyter")
+        if len(path_parts) > jupyter_index + 2:
+            return path_parts[jupyter_index + 2]
+    except ValueError:
+        return None
+    return None
+
+
+def _build_terminal_websocket_url(lab_url: str, term_name: str) -> str:
+    from urllib.parse import urlencode, urlsplit, urlunsplit
+
+    base = _jupyter_server_base(lab_url)
+    parsed = urlsplit(base)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    base_path = parsed.path if parsed.path.endswith("/") else f"{parsed.path}/"
+    ws_path = f"{base_path}terminals/websocket/{term_name}"
+
+    token = _extract_jupyter_token(lab_url)
+    query = urlencode({"token": token}) if token else ""
+    return urlunsplit((scheme, parsed.netloc, ws_path, query, ""))
+
+
+def _send_terminal_command_via_websocket(
+    page: Any,
+    *,
+    ws_url: str,
+    command: str,
+    timeout_ms: int = 5000,
+) -> bool:
+    stdin_payload = command.rstrip("\r\n") + "\r"
+    try:
+        return bool(
+            page.evaluate(
+                """
+                async ({ wsUrl, stdinData, timeoutMs }) => {
+                  return await new Promise((resolve) => {
+                    let settled = false;
+                    let socket = null;
+                    const finish = (ok) => {
+                      if (settled) return;
+                      settled = true;
+                      try {
+                        if (socket) socket.close();
+                      } catch (_) {}
+                      resolve(ok);
+                    };
+
+                    const timer = setTimeout(() => finish(false), timeoutMs);
+
+                    try {
+                      socket = new WebSocket(wsUrl);
+                    } catch (_) {
+                      clearTimeout(timer);
+                      finish(false);
+                      return;
+                    }
+
+                    socket.addEventListener("open", () => {
+                      try {
+                        socket.send(JSON.stringify(["stdin", stdinData]));
+                      } catch (_) {
+                        clearTimeout(timer);
+                        finish(false);
+                        return;
+                      }
+                      setTimeout(() => {
+                        clearTimeout(timer);
+                        finish(true);
+                      }, 180);
+                    });
+
+                    socket.addEventListener("error", () => {
+                      clearTimeout(timer);
+                      finish(false);
+                    });
+
+                    socket.addEventListener("close", () => {
+                      if (!settled) {
+                        clearTimeout(timer);
+                        finish(false);
+                      }
+                    });
+                  });
+                }
+                """,
+                {
+                    "wsUrl": ws_url,
+                    "stdinData": stdin_payload,
+                    "timeoutMs": int(timeout_ms),
+                },
+            )
+        )
+    except Exception:
+        return False
+
+
+def _send_setup_command_via_terminal_ws(
+    *,
+    context: Any,
+    page: Any,
+    lab_frame: Any,
+    batch_cmd: str,
+) -> bool:
+    term_name = _create_terminal_via_api(context, lab_frame.url)
+    if not term_name:
+        return False
+
+    ws_url = _build_terminal_websocket_url(lab_frame.url, term_name)
+    return _send_terminal_command_via_websocket(
+        page,
+        ws_url=ws_url,
+        command=batch_cmd,
+    )
+
+
+def _build_batch_setup_script(cmd_lines: list[str]) -> str:
+    """Encode setup commands as a single base64-wrapped bash line.
+
+    Instead of typing each command separately (fragile if the terminal
+    loses focus), we ship the entire script as::
+
+        echo '<base64>' | base64 -d | bash
+    """
+    import base64
+
+    script = "\n".join(cmd_lines) + "\n"
+    encoded = base64.b64encode(script.encode()).decode()
+    return f"echo '{encoded}' | base64 -d | bash"
+
+
+_TERMINAL_TAB_SELECTOR = "li.lm-TabBar-tab:has-text('Terminal'), li.lm-TabBar-tab:has-text('终端')"
+_TERMINAL_CARD_SELECTOR = (
+    "div.jp-LauncherCard:has-text('Terminal'), div.jp-LauncherCard:has-text('终端')"
+)
+_TERMINAL_INPUT_SELECTORS = (
+    "textarea.xterm-helper-textarea",
+    "div.xterm-helper-textarea textarea",
+)
+_FAST_API_XTERM_ATTACH_TIMEOUT_MS = 1600
+_FAST_API_MENU_READY_TIMEOUT_MS = 2500
+_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS = 900
+_FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS = 3500
+_FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS = 2500
+_FAST_MENU_ACTION_TIMEOUT_MS = 1800
+_API_TERMINAL_PROGRESSIVE_WAIT_MS = 1800
+_API_TERMINAL_RECOVERY_WAIT_MS = 900
+_API_TERMINAL_POLL_MS = 220
+_API_TERMINAL_TAB_POKE_INTERVAL_MS = 1200
+_FOCUS_INPUT_WAIT_TIMEOUT_MS = 900
+_FOCUS_INPUT_CLICK_TIMEOUT_MS = 500
+_FOCUS_TAB_CLICK_TIMEOUT_MS = 450
+_FOCUS_RETRY_PASSES = 4
+
+
+def _wait_for_terminal_surface(
+    lab_frame: Any,
+    *,
+    timeout_ms: int,
+) -> bool:
+    try:
+        lab_frame.locator(".xterm").first.wait_for(state="attached", timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    for selector in _TERMINAL_INPUT_SELECTORS:
+        try:
+            if lab_frame.locator(selector).first.count() > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _wait_for_terminal_surface_progressive(
+    lab_frame: Any,
+    page: Any,
+    *,
+    total_timeout_ms: int,
+    poll_ms: int = _API_TERMINAL_POLL_MS,
+    tab_poke_interval_ms: int = _API_TERMINAL_TAB_POKE_INTERVAL_MS,
+) -> bool:
+    start = time.monotonic()
+    last_tab_poke = -tab_poke_interval_ms
+    min_probe_ms = 80
+
+    while True:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        remaining_ms = total_timeout_ms - elapsed_ms
+        if remaining_ms <= 0:
+            return False
+
+        probe_timeout_ms = max(min_probe_ms, min(280, remaining_ms))
+        if _wait_for_terminal_surface(lab_frame, timeout_ms=probe_timeout_ms):
+            return True
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if elapsed_ms - last_tab_poke >= tab_poke_interval_ms:
+            _click_terminal_tab(
+                lab_frame,
+                page,
+                timeout_ms=min(_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS, 350),
+                settle_ms=40,
+            )
+            last_tab_poke = elapsed_ms
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        remaining_ms = total_timeout_ms - elapsed_ms
+        if remaining_ms <= 0:
+            return False
+        page.wait_for_timeout(max(40, min(poll_ms, remaining_ms)))
+
+
+def _wait_for_file_menu_ready(
+    lab_frame: Any,
+    *,
+    timeout_ms: int,
+) -> bool:
+    per_label_timeout = max(300, timeout_ms // 2)
+    for label in ("File", "文件"):
+        try:
+            lab_frame.get_by_role("menuitem", name=label).first.wait_for(
+                state="visible",
+                timeout=per_label_timeout,
+            )
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _click_terminal_tab(
+    lab_frame: Any,
+    page: Any,
+    *,
+    timeout_ms: int,
+    settle_ms: int = 80,
+) -> bool:
+    try:
+        term_tab = lab_frame.locator(_TERMINAL_TAB_SELECTOR).first
+        if term_tab.count() <= 0:
+            return False
+        term_tab.click(timeout=timeout_ms)
+        if settle_ms > 0:
+            page.wait_for_timeout(settle_ms)
+        return True
+    except Exception:
+        return False
+
+
+def _open_terminal_from_file_menu(
+    lab_frame: Any,
+    *,
+    action_timeout_ms: int,
+) -> bool:
+    for labels in (("File", "New", "Terminal"), ("文件", "新建", "终端")):
+        file_label, new_label, terminal_label = labels
+        try:
+            lab_frame.get_by_role("menuitem", name=file_label).first.click(
+                timeout=action_timeout_ms
+            )
+            lab_frame.get_by_role("menuitem", name=new_label).first.hover(timeout=action_timeout_ms)
+            lab_frame.get_by_role("menuitem", name=terminal_label).first.click(
+                timeout=action_timeout_ms
+            )
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _focus_terminal_input(
+    lab_frame: Any,
+    page: Any,
+) -> bool:
+    for _ in range(_FOCUS_RETRY_PASSES):
+        for selector in _TERMINAL_INPUT_SELECTORS:
+            try:
+                term_focus = lab_frame.locator(selector).first
+                term_focus.wait_for(state="attached", timeout=_FOCUS_INPUT_WAIT_TIMEOUT_MS)
+                term_focus.click(timeout=_FOCUS_INPUT_CLICK_TIMEOUT_MS)
+                page.wait_for_timeout(40)
+                return True
+            except Exception:
+                pass
+
+        _click_terminal_tab(
+            lab_frame,
+            page,
+            timeout_ms=_FOCUS_TAB_CLICK_TIMEOUT_MS,
+            settle_ms=40,
+        )
+        page.wait_for_timeout(120)
+
+    return False
+
+
+def _open_or_create_terminal(
+    context: Any,
+    page: Any,
+    lab_frame: Any,
+) -> bool:
+    """Open a terminal in JupyterLab.  REST API first, then DOM fallbacks."""
+    import sys as _sys
+
+    lab_url = lab_frame.url
+    api_term_created = False
+    api_term_navigated = False
+
+    # ------------------------------------------------------------------
+    # Strategy 1: REST API – create terminal + navigate directly to it
+    # ------------------------------------------------------------------
+    term_name = _create_terminal_via_api(context, lab_url)
+    if term_name:
+        _sys.stderr.write(f"  Created terminal '{term_name}' via REST API.\n")
+        _sys.stderr.flush()
+        server_base = _jupyter_server_base(lab_url)
+        term_url = f"{server_base}lab/terminals/{term_name}?reset"
+        try:
+            lab_frame.goto(term_url, timeout=15000, wait_until="domcontentloaded")
+            api_term_navigated = True
+            if _wait_for_terminal_surface(lab_frame, timeout_ms=_FAST_API_XTERM_ATTACH_TIMEOUT_MS):
+                return True
+        except Exception:
+            pass
+        if api_term_navigated:
+            _sys.stderr.write(
+                "  REST API terminal created but xterm not yet visible; "
+                "continuing with API terminal path.\n"
+            )
+            _sys.stderr.flush()
+            if _wait_for_terminal_surface(lab_frame, timeout_ms=500):
+                return True
+            if _wait_for_terminal_surface_progressive(
+                lab_frame,
+                page,
+                total_timeout_ms=_API_TERMINAL_PROGRESSIVE_WAIT_MS,
+            ):
+                return True
+            if _wait_for_terminal_surface_progressive(
+                lab_frame,
+                page,
+                total_timeout_ms=_API_TERMINAL_RECOVERY_WAIT_MS,
+            ):
+                return True
+            api_term_created = True
+
+        if not api_term_navigated:
+            _sys.stderr.write(
+                "  REST API terminal created but navigation failed, trying DOM fallbacks...\n"
+            )
+            _sys.stderr.flush()
+            api_term_created = True
+
+    if api_term_created:
+        if _click_terminal_tab(
+            lab_frame,
+            page,
+            timeout_ms=min(_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS, 500),
+            settle_ms=60,
+        ) and _wait_for_terminal_surface_progressive(
+            lab_frame,
+            page,
+            total_timeout_ms=900,
+        ):
+            return True
+        if _open_terminal_from_file_menu(
+            lab_frame,
+            action_timeout_ms=_FAST_MENU_ACTION_TIMEOUT_MS,
+        ) and _wait_for_terminal_surface_progressive(
+            lab_frame,
+            page,
+            total_timeout_ms=2200,
+        ):
+            return True
+        _wait_for_file_menu_ready(lab_frame, timeout_ms=_FAST_API_MENU_READY_TIMEOUT_MS)
+    else:
+        try:
+            lab_frame.locator(_TERMINAL_CARD_SELECTOR).first.wait_for(
+                state="visible", timeout=45000
+            )
+        except Exception:
+            _wait_for_file_menu_ready(lab_frame, timeout_ms=45000)
+
+    for _pass in range(1):
+        dismissed = False
+        for label in ("Dismiss", "No", "否", "不接收", "取消"):
+            try:
+                btn = lab_frame.get_by_role("button", name=label)
+                if btn.count() > 0:
+                    btn.first.click(timeout=1000)
+                    dismissed = True
+                    break
+            except Exception:
+                pass
+        if not dismissed:
+            try:
+                close_btn = lab_frame.locator("button.jp-Dialog-close, button[aria-label='Close']")
+                if close_btn.count() > 0:
+                    close_btn.first.click(timeout=1000)
+                    dismissed = True
+            except Exception:
+                pass
+        if dismissed:
+            page.wait_for_timeout(150)
+        else:
+            break
+
+    terminal_opened = False
+
+    if _click_terminal_tab(
+        lab_frame,
+        page,
+        timeout_ms=_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS,
+        settle_ms=100,
+    ):
+        terminal_opened = True
+
+    if not terminal_opened:
+        terminal_card = lab_frame.locator(_TERMINAL_CARD_SELECTOR)
+        card_wait_timeout = _FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS if api_term_created else 8000
+        card_click_timeout = _FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS if api_term_created else 8000
+        try:
+            terminal_card.first.wait_for(state="visible", timeout=card_wait_timeout)
+            terminal_card.first.click(timeout=card_click_timeout)
+            terminal_opened = True
+        except Exception:
+            pass
+
+    if not terminal_opened:
+        try:
+            launcher_btn = lab_frame.locator(
+                "button[title*='Launcher'], button[aria-label*='Launcher']"
+            ).first
+            if launcher_btn.count() > 0:
+                launcher_btn.click(timeout=1200)
+                page.wait_for_timeout(150)
+            terminal_card = lab_frame.locator(_TERMINAL_CARD_SELECTOR)
+            card_wait_timeout = _FAST_TERMINAL_CARD_WAIT_TIMEOUT_MS if api_term_created else 8000
+            card_click_timeout = _FAST_TERMINAL_CARD_CLICK_TIMEOUT_MS if api_term_created else 8000
+            terminal_card.first.wait_for(state="visible", timeout=card_wait_timeout)
+            terminal_card.first.click(timeout=card_click_timeout)
+            terminal_opened = True
+        except Exception:
+            pass
+
+    if not terminal_opened:
+        menu_action_timeout = _FAST_MENU_ACTION_TIMEOUT_MS if api_term_created else 2000
+        if _open_terminal_from_file_menu(lab_frame, action_timeout_ms=menu_action_timeout):
+            terminal_opened = True
+
+    if not terminal_opened and api_term_created:
+        terminal_opened = _wait_for_terminal_surface(lab_frame, timeout_ms=1200)
+
+    if not terminal_opened:
+        return False
+
+    _click_terminal_tab(
+        lab_frame,
+        page,
+        timeout_ms=_FAST_TERMINAL_TAB_CLICK_TIMEOUT_MS,
+        settle_ms=80,
+    )
+
+    for label in ("Dismiss", "No", "否", "不接收", "取消"):
+        try:
+            btn = lab_frame.get_by_role("button", name=label)
+            if btn.count() > 0:
+                btn.first.click(timeout=1000)
+                page.wait_for_timeout(120)
+                break
+        except Exception:
+            pass
+
+    return True
+
+
+def _build_vscode_proxy_url(page, *, port: int) -> str | None:  # noqa: ANN001
+    from urllib.parse import parse_qs, urlparse
+
+    vscode_url = None
+    for frame in page.frames:
+        if "/vscode/" in (frame.url or ""):
+            vscode_url = frame.url
+            break
+    if not vscode_url:
+        return None
+
+    parsed = urlparse(vscode_url)
+    token = parse_qs(parsed.query).get("token", [None])[0]
+    base = vscode_url.split("?", 1)[0].rstrip("/")
+    proxy_url = f"{base}/proxy/{port}/"
+    if token:
+        proxy_url = f"{proxy_url}?token={token}"
+    return proxy_url
+
+
+def _derive_vscode_proxy_url(proxy_url: str) -> str | None:
+    """Derive a VSCode proxy URL from a Jupyter proxy URL.
+
+    Many platform deployments expose both:
+      - /jupyter/<notebook>/<token>/proxy/<port>/
+      - /vscode/<notebook>/<token>/proxy/<port>/
+
+    The VSCode proxy is generally more reliable for WebSocket-based tunnels.
+    """
+    proxy_url = str(proxy_url or "").strip()
+    if not proxy_url:
+        return None
+    if "/vscode/" in proxy_url:
+        return proxy_url
+    if "/jupyter/" not in proxy_url:
+        return None
+    return proxy_url.replace("/jupyter/", "/vscode/", 1)
+
+
+def _extract_probe_error_summary(error: Exception) -> str:
+    message = str(error).strip()
+    if not message:
+        return error.__class__.__name__
+
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    if not lines:
+        return error.__class__.__name__
+
+    headline = lines[0]
+    last_response = next((line for line in lines if line.startswith("Last response:")), "")
+    if last_response:
+        return f"{headline}; {last_response}"
+    return headline
+
+
+def _ensure_proxy_readiness_with_fallback(
+    *,
+    proxy_url: str,
+    port: int,
+    timeout: int,
+    context,  # noqa: ANN001
+    page,  # noqa: ANN001
+) -> tuple[str, list[str]]:
+    import sys as _sys
+
+    diagnostics: list[str] = []
+    primary_verify_timeout_s = max(12, min(timeout, 35))
+
+    derived_vscode_url = _derive_vscode_proxy_url(proxy_url)
+    if derived_vscode_url and derived_vscode_url != proxy_url:
+        _sys.stderr.write(
+            f"  Probing VSCode proxy URL first: {redact_proxy_url(derived_vscode_url)}\n"
+        )
+        _sys.stderr.flush()
+        try:
+            wait_for_rtunnel_reachable(
+                proxy_url=derived_vscode_url,
+                timeout_s=max(12, min(timeout, 45)),
+                context=context,
+                page=page,
+            )
+            return derived_vscode_url, diagnostics
+        except Exception as derived_error:
+            diagnostics.append(f"derived={_extract_probe_error_summary(derived_error)}")
+
+    try:
+        wait_for_rtunnel_reachable(
+            proxy_url=proxy_url,
+            timeout_s=primary_verify_timeout_s,
+            context=context,
+            page=page,
+        )
+        return proxy_url, diagnostics
+    except Exception as primary_error:
+        diagnostics.append(f"primary={_extract_probe_error_summary(primary_error)}")
+
+    fallback_proxy_url = _build_vscode_proxy_url(page, port=port)
+    if not fallback_proxy_url:
+        try:
+            vscode_tab = page.locator('img[alt="vscode"]').first
+            if vscode_tab.count() > 0:
+                vscode_tab.click(timeout=1500)
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+        fallback_proxy_url = _build_vscode_proxy_url(page, port=port)
+
+    best_for_ssh = proxy_url
+    if derived_vscode_url and derived_vscode_url != proxy_url:
+        best_for_ssh = derived_vscode_url
+    if fallback_proxy_url and fallback_proxy_url != proxy_url:
+        best_for_ssh = fallback_proxy_url
+
+    if not fallback_proxy_url or fallback_proxy_url == proxy_url:
+        _sys.stderr.write("  Proxy did not pass HTTP readiness; continuing with SSH preflight.\n")
+        _sys.stderr.flush()
+        return best_for_ssh, diagnostics
+
+    _sys.stderr.write(f"  Trying alternate proxy URL: {redact_proxy_url(fallback_proxy_url)}\n")
+    _sys.stderr.flush()
+    try:
+        wait_for_rtunnel_reachable(
+            proxy_url=fallback_proxy_url,
+            timeout_s=max(12, min(timeout, 45)),
+            context=context,
+            page=page,
+        )
+        return fallback_proxy_url, diagnostics
+    except Exception as fallback_error:
+        diagnostics.append(f"fallback={_extract_probe_error_summary(fallback_error)}")
+        _sys.stderr.write(
+            "  Fallback proxy did not pass HTTP readiness; " "continuing with SSH preflight.\n"
+        )
+        _sys.stderr.flush()
+        return best_for_ssh, diagnostics
+
+
+def _setup_notebook_rtunnel_sync(
+    notebook_id: str,
+    port: int = 31337,
+    ssh_port: int = 22222,
+    ssh_public_key: Optional[str] = None,
+    ssh_runtime: Optional[SshRuntimeConfig] = None,
+    session: Optional[WebSession] = None,
+    headless: bool = True,
+    timeout: int = 120,
+) -> str:
+    """Sync implementation for setup_notebook_rtunnel."""
+    import sys as _sys
+
+    from playwright.sync_api import sync_playwright
+
+    from inspire.platform.web.browser_api.playwright_notebooks import (
+        build_jupyter_proxy_url,
+        open_notebook_lab,
+    )
+
+    timing = _timing_enabled()
+    timer = _StepTimer(enabled=timing)
+
+    if session is None:
+        session = get_web_session()
+    account = session.login_username
+    timer.mark("session_init")
+
+    existing = probe_existing_rtunnel_proxy_url(
+        notebook_id=notebook_id,
+        port=port,
+        session=session,
+        account=account,
+    )
+    if existing:
+        timer.mark("probe_existing")
+        timer.summary()
+        _sys.stderr.write("Using existing rtunnel connection (fast path).\n")
+        _sys.stderr.flush()
+        return existing
+
+    timer.mark("probe_existing")
+    _sys.stderr.write("Setting up rtunnel tunnel via browser automation...\n")
+    _sys.stderr.flush()
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p, headless=headless)
+        timer.mark("playwright_launch")
+        context = _new_context(browser, storage_state=session.storage_state)
+        page = context.new_page()
+        timer.mark("context_and_page")
+
+        try:
+            lab_frame = open_notebook_lab(page, notebook_id=notebook_id, timeout=60000)
+            timer.mark("open_lab")
+            jupyter_proxy_url = build_jupyter_proxy_url(lab_frame.url, port=port)
+            timer.mark("build_proxy_url")
+
+            try:
+                lab_frame.locator("text=加载中").first.wait_for(state="hidden", timeout=30000)
+            except Exception:
+                pass
+            timer.mark("wait_spinner")
+
+            cmd_lines = build_rtunnel_setup_commands(
+                port=port,
+                ssh_port=ssh_port,
+                ssh_public_key=ssh_public_key,
+                ssh_runtime=ssh_runtime,
+            )
+            batch_cmd = _build_batch_setup_script(cmd_lines)
+
+            setup_sent_via_ws = False
+            try:
+                setup_sent_via_ws = _send_setup_command_via_terminal_ws(
+                    context=context,
+                    page=page,
+                    lab_frame=lab_frame,
+                    batch_cmd=batch_cmd,
+                )
+            except Exception:
+                setup_sent_via_ws = False
+
+            if setup_sent_via_ws:
+                _sys.stderr.write("  Sent setup script via Jupyter terminal WebSocket.\n")
+                _sys.stderr.flush()
+                timer.mark("open_terminal")
+                timer.mark("focus_xterm")
+                timer.mark("build_and_send_cmd")
+            else:
+                if not _open_or_create_terminal(context, page, lab_frame):
+                    raise ValueError("Failed to open Jupyter terminal")
+                timer.mark("open_terminal")
+
+                if not _focus_terminal_input(lab_frame, page):
+                    page.wait_for_timeout(350)
+                    if not _wait_for_terminal_surface(lab_frame, timeout_ms=2000):
+                        raise ValueError(
+                            "Failed to focus Jupyter terminal: xterm surface not ready"
+                        )
+                    if not _focus_terminal_input(lab_frame, page):
+                        raise ValueError("Failed to focus Jupyter terminal input")
+                timer.mark("focus_xterm")
+
+                _sys.stderr.write(
+                    f"  Executing setup script ({len(batch_cmd)} chars) "
+                    f"in notebook terminal...\n"
+                )
+                _sys.stderr.flush()
+                page.keyboard.insert_text(batch_cmd)
+                page.keyboard.press("Enter")
+                timer.mark("build_and_send_cmd")
+
+            # xterm.js renders to <canvas>, so Playwright text locators are
+            # blind to terminal output.  A short fixed delay lets the setup
+            # script finish; actual readiness is verified by
+            # _ensure_proxy_readiness_with_fallback() below.
+            page.wait_for_timeout(3000)
+            timer.mark("wait_marker")
+
+            try:
+                page.screenshot(path="/tmp/notebook_terminal_debug.png")
+            except Exception:
+                pass
+            timer.mark("screenshot")
+
+            proxy_url = jupyter_proxy_url
+            _sys.stderr.write(
+                f"  Verifying rtunnel is reachable at: {redact_proxy_url(proxy_url)}\n"
+            )
+            _sys.stderr.flush()
+            proxy_url, probe_diagnostics = _ensure_proxy_readiness_with_fallback(
+                proxy_url=proxy_url,
+                port=port,
+                timeout=timeout,
+                context=context,
+                page=page,
+            )
+            if probe_diagnostics:
+                _sys.stderr.write(
+                    "  Proxy readiness summary: " + " | ".join(probe_diagnostics) + "\n"
+                )
+                _sys.stderr.flush()
+            timer.mark("verify_proxy")
+
+            try:
+                save_rtunnel_proxy_state(
+                    notebook_id=notebook_id,
+                    proxy_url=proxy_url,
+                    port=port,
+                    ssh_port=ssh_port,
+                    base_url=_get_base_url(),
+                    account=account,
+                )
+            except Exception:
+                pass
+            timer.mark("save_state")
+
+            return proxy_url
+
+        finally:
+            timer.summary()
+            # Rely on sync_playwright() shutdown to terminate browser processes.
+            # Explicit context/browser close can hang on some deployments.
+
+
+# ============================================================================
+# Public entry point
+# ============================================================================
+
+
+def setup_notebook_rtunnel(
+    notebook_id: str,
+    port: int = 31337,
+    ssh_port: int = 22222,
+    ssh_public_key: Optional[str] = None,
+    ssh_runtime: Optional[SshRuntimeConfig] = None,
+    session: Optional[WebSession] = None,
+    headless: bool = True,
+    timeout: int = 120,
+) -> str:
+    """Ensure the notebook exposes an rtunnel server via Jupyter proxy."""
+    if _in_asyncio_loop():
+        return _run_in_thread(
+            _setup_notebook_rtunnel_sync,
+            notebook_id=notebook_id,
+            port=port,
+            ssh_port=ssh_port,
+            ssh_public_key=ssh_public_key,
+            ssh_runtime=ssh_runtime,
+            session=session,
+            headless=headless,
+            timeout=timeout,
+        )
+    return _setup_notebook_rtunnel_sync(
+        notebook_id=notebook_id,
+        port=port,
+        ssh_port=ssh_port,
+        ssh_public_key=ssh_public_key,
+        ssh_runtime=ssh_runtime,
+        session=session,
+        headless=headless,
+        timeout=timeout,
+    )
+
+
+__all__ = ["setup_notebook_rtunnel"]

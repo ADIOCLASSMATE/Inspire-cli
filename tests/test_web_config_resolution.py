@@ -8,7 +8,7 @@ import pytest
 
 from inspire.cli.utils.notebook_cli import get_base_url
 from inspire.config import Config
-from inspire.platform.web.browser_api.notebooks.http.api import _config_compute_groups_fallback
+from inspire.platform.web.browser_api.notebooks import _config_compute_groups_fallback
 
 
 def test_notebook_cli_base_url_respects_prefer_source_toml(
@@ -16,13 +16,15 @@ def test_notebook_cli_base_url_respects_prefer_source_toml(
 ) -> None:
     project_dir = tmp_path / ".inspire"
     project_dir.mkdir()
-    (project_dir / "config.toml").write_text("""
+    (project_dir / "config.toml").write_text(
+        """
 [cli]
 prefer_source = "toml"
 
 [api]
 base_url = "https://toml.example"
-""")
+"""
+    )
     monkeypatch.setattr(Config, "GLOBAL_CONFIG_PATH", tmp_path / "missing" / "config.toml")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("INSPIRE_BASE_URL", "https://env.example")
@@ -35,12 +37,14 @@ def test_notebook_compute_group_fallback_uses_layered_config(
 ) -> None:
     project_dir = tmp_path / ".inspire"
     project_dir.mkdir()
-    (project_dir / "config.toml").write_text("""
+    (project_dir / "config.toml").write_text(
+        """
 [[compute_groups]]
 name = "H200 A"
 id = "lcg-test-1"
 gpu_type = "H200"
-""")
+"""
+    )
     monkeypatch.setattr(Config, "GLOBAL_CONFIG_PATH", tmp_path / "missing" / "config.toml")
     monkeypatch.chdir(tmp_path)
 

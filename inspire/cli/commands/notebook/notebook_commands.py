@@ -6,6 +6,9 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 import click
 
@@ -30,6 +33,7 @@ from inspire.config.ssh_runtime import resolve_ssh_runtime_config
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web import session as web_session_module
+from inspire.platform.web.browser_api.rtunnel import redact_proxy_url
 
 _ZERO_WORKSPACE_ID = "ws-00000000-0000-0000-0000-000000000000"
 
@@ -193,8 +197,11 @@ def _validate_notebook_account_access(
     if owner_names and current_username and current_username in owner_names:
         return True, ""
 
-    if owner_ids and current_user_id and current_user_id not in owner_ids and (
-        not member_ids or current_user_id not in member_ids
+    if (
+        owner_ids
+        and current_user_id
+        and current_user_id not in owner_ids
+        and (not member_ids or current_user_id not in member_ids)
     ):
         return (
             False,
@@ -210,6 +217,34 @@ def _validate_notebook_account_access(
         )
 
     return True, ""
+
+
+def _format_proxy_http_body(raw: bytes) -> str:
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    compact = " ".join(text.split())
+    return compact[:180]
+
+
+def _describe_proxy_http_status(proxy_url: str, timeout_s: float = 4.0) -> str:
+    parsed = urllib_parse.urlsplit(proxy_url)
+    if parsed.scheme not in {"http", "https"}:
+        return "n/a (non-http proxy URL)"
+
+    request = urllib_request.Request(proxy_url, method="GET")
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_s) as response:
+            body = _format_proxy_http_body(response.read(220))
+            return f"{response.status} {body}".strip()
+    except urllib_error.HTTPError as error:
+        try:
+            body = _format_proxy_http_body(error.read(220))
+        except Exception:
+            body = ""
+        return f"{error.code} {body}".strip()
+    except Exception as error:
+        return str(error)
 
 
 def _list_notebooks_for_workspace(
@@ -408,20 +443,23 @@ def _resolve_notebook_id(
 @click.option(
     "--resource",
     "-r",
-    default=lambda: os.environ.get("INSPIRE_NOTEBOOK_RESOURCE", "1xH200"),
-    help="Resource spec (e.g., 1xH200, 4xH100, 4CPU)",
+    default=None,
+    help="Resource spec (e.g., 1xH200, 4xH100, 4CPU) (default from config [notebook].resource)",
 )
 @click.option(
     "--project",
     "-p",
-    default=lambda: os.environ.get("INSPIRE_PROJECT_ID"),
-    help="Project name or ID",
+    default=None,
+    help="Project name or ID (default from config [context].project or [job].project_id)",
 )
 @click.option(
     "--image",
     "-i",
-    default=lambda: (os.environ.get("INSPIRE_NOTEBOOK_IMAGE") or os.environ.get("INSP_IMAGE")),
-    help="Image name/URL (prompts interactively if omitted)",
+    default=None,
+    help=(
+        "Image name/URL (default from config [notebook].image or [job].image; prompts interactively "
+        "if still omitted)"
+    ),
 )
 @click.option(
     "--shm-size",
@@ -467,7 +505,7 @@ def create_notebook_cmd(
     name: Optional[str],
     workspace: Optional[str],
     workspace_id: Optional[str],
-    resource: str,
+    resource: Optional[str],
     project: Optional[str],
     image: Optional[str],
     shm_size: Optional[int],
@@ -494,6 +532,8 @@ def create_notebook_cmd(
         inspire notebook create --no-keepalive --no-wait  # Old behavior (return immediately)
         inspire notebook create --priority 5        # Set task priority to 5
     """
+    project_explicit = bool(project)
+
     run_notebook_create(
         ctx,
         name=name,
@@ -509,6 +549,7 @@ def create_notebook_cmd(
         keepalive=keepalive,
         json_output=json_output,
         priority=priority,
+        project_explicit=project_explicit,
     )
 
 
@@ -799,6 +840,7 @@ def _print_notebook_detail(notebook: dict) -> None:
 )
 @click.option(
     "--all-workspaces",
+    "-A",
     is_flag=True,
     help="List notebooks across all configured workspaces (cpu/gpu/internet)",
 )
@@ -1059,17 +1101,17 @@ def run_notebook_ssh(
         BridgeProfile,
         get_ssh_command_args,
         has_internet_for_gpu_type,
+        is_tunnel_available,
         load_tunnel_config,
         save_tunnel_config,
     )
-    from inspire.cli.utils.notebook_cli import require_web_session
 
     session = require_web_session(
         ctx,
         hint=(
             "Notebook SSH requires web authentication. "
             "Set [auth].username and configure password via INSPIRE_PASSWORD "
-            "or global [accounts.\"<username>\"].password."
+            'or global [accounts."<username>"].password.'
         ),
     )
 
@@ -1121,14 +1163,13 @@ def run_notebook_ssh(
         _handle_error(
             ctx,
             "ConfigError",
-            "Notebook/account mismatch detected before tunnel setup: "
-            f"{reason}.",
+            "Notebook/account mismatch detected before tunnel setup: " f"{reason}.",
             EXIT_CONFIG_ERROR,
             hint=(
                 f"Notebook '{notebook_id}' appears to belong to another account. "
                 f"Switch [auth].username for this project (current: {user_label}) and ensure a "
                 "matching password is available via INSPIRE_PASSWORD or global "
-                "[accounts.\"<username>\"].password."
+                '[accounts."<username>"].password.'
             ),
         )
         return
@@ -1222,6 +1263,27 @@ def run_notebook_ssh(
     config = load_tunnel_config(account=tunnel_account)
     config.add_bridge(bridge)
     save_tunnel_config(config)
+
+    if not is_tunnel_available(
+        bridge_name=profile_name,
+        config=config,
+        retries=6,
+        retry_pause=1.5,
+    ):
+        proxy_status = _describe_proxy_http_status(proxy_url)
+        _handle_error(
+            ctx,
+            "APIError",
+            "Tunnel setup completed, but SSH preflight failed.",
+            EXIT_API_ERROR,
+            hint=(
+                "Retry 'inspire notebook ssh <notebook-id>' in a few seconds, "
+                "or run 'inspire tunnel test -b "
+                f"{profile_name}' to inspect connectivity. "
+                f"Proxy readiness report: {proxy_status} ({redact_proxy_url(proxy_url)})."
+            ),
+        )
+        return
 
     internet_status = "yes" if has_internet else "no"
     gpu_label = gpu_type if gpu_type else "CPU"

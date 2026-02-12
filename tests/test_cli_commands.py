@@ -9,6 +9,7 @@ from inspire.cli.main import main as cli_main
 from inspire.cli.context import (
     Context,
     EXIT_SUCCESS,
+    EXIT_API_ERROR,
     EXIT_CONFIG_ERROR,
     EXIT_AUTH_ERROR,
     EXIT_TIMEOUT,
@@ -186,7 +187,7 @@ def patch_config_and_auth(
     monkeypatch.setattr(
         browser_api_module,
         "select_project",
-        lambda projects, requested=None: (test_project, None),
+        lambda projects, requested=None, **_: (test_project, None),
     )
 
     return api
@@ -872,7 +873,9 @@ base_url = "https://my-inspire.internal"
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
-    monkeypatch.setattr(config_module.Config, "get_config_paths", classmethod(fake_get_config_paths))
+    monkeypatch.setattr(
+        config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
+    )
     monkeypatch.setenv("INSPIRE_BASE_URL", "https://env.example")
     monkeypatch.setattr(auth_module.AuthManager, "get_api", lambda _cls, cfg=None: DummyAPI())
 
@@ -907,7 +910,9 @@ def test_config_check_rejects_placeholder_base_url(
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
-    monkeypatch.setattr(config_module.Config, "get_config_paths", classmethod(fake_get_config_paths))
+    monkeypatch.setattr(
+        config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
+    )
     monkeypatch.setattr(
         auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
     )
@@ -933,7 +938,10 @@ def test_config_check_requires_docker_registry(
     def fake_from_files_and_env(
         cls, require_target_dir: bool = False, require_credentials: bool = True
     ):  # type: ignore[override]
-        return config, {"base_url": config_module.SOURCE_ENV, "docker_registry": config_module.SOURCE_DEFAULT}
+        return config, {
+            "base_url": config_module.SOURCE_ENV,
+            "docker_registry": config_module.SOURCE_DEFAULT,
+        }
 
     def fake_get_config_paths(cls):  # type: ignore[override]
         return None, None
@@ -941,7 +949,9 @@ def test_config_check_requires_docker_registry(
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
-    monkeypatch.setattr(config_module.Config, "get_config_paths", classmethod(fake_get_config_paths))
+    monkeypatch.setattr(
+        config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
+    )
     monkeypatch.setattr(
         auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
     )
@@ -979,7 +989,9 @@ def test_config_check_rejects_top_level_project_base_url_key(
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
-    monkeypatch.setattr(config_module.Config, "get_config_paths", classmethod(fake_get_config_paths))
+    monkeypatch.setattr(
+        config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
+    )
     monkeypatch.setattr(
         auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
     )
@@ -1015,7 +1027,9 @@ def test_config_check_allows_path_defaults_for_endpoint_fields(
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
-    monkeypatch.setattr(config_module.Config, "get_config_paths", classmethod(fake_get_config_paths))
+    monkeypatch.setattr(
+        config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
+    )
     monkeypatch.setattr(auth_module.AuthManager, "get_api", lambda _cls, cfg=None: DummyAPI())
 
     runner = CliRunner()
@@ -1545,6 +1559,11 @@ def test_run_notebook_ssh_passes_resolved_runtime_to_setup(
         "get_ssh_command_args",
         lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
     )
+    monkeypatch.setattr(
+        tunnel_module,
+        "is_tunnel_available",
+        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
+    )
 
     def fake_execvp(file: str, args: list[str]) -> None:
         execvp_args["file"] = file
@@ -1571,3 +1590,116 @@ def test_run_notebook_ssh_passes_resolved_runtime_to_setup(
     assert exc.value.code == 0
     assert setup_kwargs["ssh_runtime"] is resolved_runtime
     assert execvp_args["file"] == "ssh"
+
+
+def test_run_notebook_ssh_reports_when_tunnel_not_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeSession:
+        workspace_id = "ws-test"
+        storage_state = {}
+
+    class FakeTunnelConfig:
+        def __init__(self) -> None:
+            self.bridges: dict[str, object] = {}
+            self.default_bridge = None
+
+        def add_bridge(self, profile: object) -> None:
+            self.bridges[str(getattr(profile, "name", "default"))] = profile
+
+    captured: dict[str, str] = {}
+
+    def fake_handle_error(
+        ctx: Context,
+        error_type: str,
+        message: str,
+        exit_code: int,
+        *,
+        hint: Optional[str] = None,
+    ) -> None:
+        assert ctx is not None
+        captured["type"] = error_type
+        captured["message"] = message
+        captured["hint"] = hint or ""
+        raise SystemExit(exit_code)
+
+    monkeypatch.setattr(notebook_cmd_module, "_handle_error", fake_handle_error)
+    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "_resolve_notebook_id",
+        lambda *args, **kwargs: ("notebook-12345678", None),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "wait_for_notebook_running",
+        lambda notebook_id, session=None: {
+            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
+        },
+    )
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "_get_current_user_detail",
+        lambda session, base_url: {"id": "user-1", "username": "user"},
+    )
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "_validate_notebook_account_access",
+        lambda current_user, notebook_detail: (True, ""),
+    )
+    monkeypatch.setattr(
+        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
+    )
+    monkeypatch.setattr(
+        notebook_cmd_module,
+        "resolve_ssh_runtime_config",
+        lambda cli_overrides=None: SshRuntimeConfig(),
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "setup_notebook_rtunnel",
+        lambda **kwargs: "wss://proxy.example/notebook/",
+    )
+
+    fake_tunnel_config = FakeTunnelConfig()
+    monkeypatch.setattr(
+        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
+    )
+    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
+    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
+    monkeypatch.setattr(
+        tunnel_module,
+        "is_tunnel_available",
+        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: False,
+    )
+    monkeypatch.setattr(
+        tunnel_module,
+        "get_ssh_command_args",
+        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
+    )
+    monkeypatch.setattr(
+        notebook_cmd_module.os,
+        "execvp",
+        lambda file, args: (_ for _ in ()).throw(AssertionError("execvp should not run")),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        notebook_cmd_module.run_notebook_ssh(
+            Context(),
+            notebook_id="nb-name",
+            wait=True,
+            pubkey=None,
+            save_as=None,
+            port=31337,
+            ssh_port=22222,
+            command=None,
+            rtunnel_bin="/cli/rtunnel",
+            debug_playwright=False,
+            setup_timeout=60,
+        )
+
+    assert exc.value.code == EXIT_API_ERROR
+    assert captured["type"] == "APIError"
+    assert "SSH preflight failed" in captured["message"]
+    assert "Proxy readiness report:" in captured["hint"]
