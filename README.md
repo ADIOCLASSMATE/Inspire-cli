@@ -51,10 +51,12 @@ inspire resources list
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
 | `inspire bridge exec "<cmd>"` | Run command on Bridge runner |
-| `inspire bridge ssh` | Interactive SSH shell to Bridge |
+| `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
+| `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
 | `inspire notebook list/create` | List or create notebook instances |
 | `inspire notebook start/stop` | Start or stop a notebook |
 | `inspire notebook ssh <id>` | SSH into notebook (sets up tunnel) |
+| `inspire notebook top` | Show GPU utilization/memory for tunnel-backed notebooks |
 | `inspire image list/detail` | Browse Docker images |
 | `inspire image save/register` | Save or register custom images |
 | `inspire tunnel add/list/status` | Manage SSH tunnels to Bridge |
@@ -80,10 +82,27 @@ inspire sync && inspire bridge exec "git log -1"
 inspire notebook ssh <notebook-id> --save-as mybridge
 ssh mybridge
 
+# Check live GPU usage for all saved notebook tunnels
+inspire notebook top
+inspire notebook top --bridge mybridge --watch
+
+# Copy files through a configured bridge profile
+inspire bridge scp ./model.py /tmp/model.py --bridge mybridge
+inspire bridge scp -d /tmp/checkpoints/ ./checkpoints/ -r --bridge mybridge
+
 # Check GPU availability and project quota
 inspire resources list
 inspire project list
 ```
+
+## SSH/SCP Reliability Notes
+
+- There is no `inspire tunnel start` command. Create or refresh bridge profiles with `inspire notebook ssh <notebook-id> --save-as <name>` (or `inspire tunnel add` / `inspire tunnel update`), then validate with `inspire tunnel status`.
+- `inspire bridge ssh` and `inspire bridge scp` validate `--bridge` names before connectivity checks. If a profile is missing, run `inspire tunnel list`.
+- Saved notebook profiles now store the source notebook ID. Reusing `--save-as <name>` for a different notebook refreshes the tunnel instead of reusing stale tunnel state.
+- `inspire bridge ssh`, `inspire bridge exec`, and interactive `inspire notebook ssh` auto-rebuild/reconnect dropped tunnels for notebook-backed profiles, using `tunnel.retries` / `tunnel.retry_pause` as retry controls.
+- Non-notebook tunnel profiles (for example, manually added profiles without `notebook_id`) cannot be auto-rebuilt and still require manual tunnel recovery.
+- `inspire tunnel ssh-config` now writes shell-quoted `ProxyCommand` entries so proxy URLs with query parameters/tokens remain safe in `~/.ssh/config`.
 
 ## Configuration
 

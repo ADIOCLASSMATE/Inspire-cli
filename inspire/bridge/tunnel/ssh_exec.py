@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import select
 import subprocess
 import time
@@ -21,6 +22,17 @@ from .ssh import _get_proxy_command
 # ---------------------------------------------------------------------------
 # Core helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_ssh_process_env() -> dict[str, str]:
+    """Build environment for SSH subprocesses with a universally available locale.
+
+    This prevents remote login shells from inheriting unsupported locale values
+    (for example ``en_US.UTF-8``) via SSH env forwarding.
+    """
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "LANG": "C"})
+    return env
 
 
 def _resolve_bridge_and_proxy(
@@ -107,6 +119,7 @@ def run_ssh_command(
         text=True,
         timeout=timeout,
         check=check,
+        env=_build_ssh_process_env(),
     )
 
 
@@ -162,6 +175,7 @@ def run_ssh_command_streaming(
         stderr=subprocess.STDOUT,
         bufsize=1,
         universal_newlines=True,
+        env=_build_ssh_process_env(),
     )
 
     # Feed the command via stdin so it never appears in the process cmdline.
@@ -181,24 +195,21 @@ def run_ssh_command_streaming(
                     process.wait()
                     raise subprocess.TimeoutExpired(ssh_cmd, timeout)
 
-            # Check if process has ended
+            # Read from a single path (readline only) so lines cannot be emitted twice.
             if process.poll() is not None:
-                # Drain any remaining output
-                for line in process.stdout:
-                    output_callback(line)
-                break
-
-            # Use select to wait for output with 1-second timeout
-            ready, _, _ = select.select([process.stdout], [], [], 1.0)
-
-            if ready:
                 line = process.stdout.readline()
-                if line:
-                    output_callback(line)
-                elif process.poll() is not None:
-                    # EOF reached (process exited)
-                    break
-                # else: temporary no data, continue waiting
+            else:
+                ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                line = process.stdout.readline()
+
+            if line:
+                output_callback(line)
+                continue
+
+            if process.poll() is not None:
+                break
 
         return process.returncode
 
@@ -213,6 +224,7 @@ def run_ssh_command_streaming(
 
 
 __all__ = [
+    "_build_ssh_process_env",
     "_build_ssh_base_args",
     "_build_stdin_script",
     "_resolve_bridge_and_proxy",

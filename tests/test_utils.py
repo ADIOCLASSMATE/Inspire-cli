@@ -15,6 +15,7 @@ from inspire.config import (
 from inspire.bridge.tunnel import (
     BridgeProfile,
     TunnelConfig,
+    generate_ssh_config,
     load_tunnel_config,
     save_tunnel_config,
     _get_proxy_command,
@@ -455,6 +456,7 @@ class TestBridgeProfile:
             proxy_url="https://proxy.example.com",
             ssh_user="admin",
             ssh_port=22222,
+            rtunnel_port=31337,
         )
 
         d = profile.to_dict()
@@ -463,6 +465,7 @@ class TestBridgeProfile:
         assert d["proxy_url"] == "https://proxy.example.com"
         assert d["ssh_user"] == "admin"
         assert d["ssh_port"] == 22222
+        assert d["rtunnel_port"] == 31337
 
     def test_from_dict(self) -> None:
         """Test creating profile from dict."""
@@ -471,6 +474,7 @@ class TestBridgeProfile:
             "proxy_url": "https://proxy.example.com",
             "ssh_user": "admin",
             "ssh_port": 22222,
+            "rtunnel_port": 31337,
         }
 
         profile = BridgeProfile.from_dict(d)
@@ -479,6 +483,7 @@ class TestBridgeProfile:
         assert profile.proxy_url == "https://proxy.example.com"
         assert profile.ssh_user == "admin"
         assert profile.ssh_port == 22222
+        assert profile.rtunnel_port == 31337
 
     def test_from_dict_with_defaults(self) -> None:
         """Test creating profile from dict with default values."""
@@ -493,6 +498,17 @@ class TestBridgeProfile:
         assert profile.ssh_user == "root"  # default
         assert profile.ssh_port == 22222  # default
         assert profile.has_internet is True  # default
+        assert profile.rtunnel_port == 31337
+
+    def test_from_dict_infers_rtunnel_port_from_proxy_url(self) -> None:
+        d = {
+            "name": "test-bridge",
+            "proxy_url": "https://proxy.example.com/notebook/abc/proxy/32222/",
+        }
+
+        profile = BridgeProfile.from_dict(d)
+
+        assert profile.rtunnel_port == 32222
 
     def test_has_internet_field(self) -> None:
         """Test has_internet field in BridgeProfile."""
@@ -813,3 +829,17 @@ class TestProxyCommand:
 
         # Should include stderr redirect
         assert "2>/dev/null" in cmd
+
+    def test_generate_ssh_config_reuses_shell_quoted_proxy_command(self, tmp_path: Path) -> None:
+        """Generated ssh-config should preserve safe shell quoting for ProxyCommand."""
+        bridge = BridgeProfile(
+            name="test",
+            proxy_url="https://proxy.example.com/tunnel?token=a*b",
+        )
+        rtunnel_bin = tmp_path / "rtunnel with space"
+
+        ssh_config = generate_ssh_config(bridge, rtunnel_bin, host_alias="mybridge")
+        expected_proxy = _get_proxy_command(bridge, rtunnel_bin, quiet=False)
+
+        assert "Host mybridge" in ssh_config
+        assert f"ProxyCommand {expected_proxy}" in ssh_config

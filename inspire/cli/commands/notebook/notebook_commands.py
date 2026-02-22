@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+import subprocess
+import time
 from typing import Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -28,7 +29,14 @@ from inspire.cli.utils.notebook_cli import (
     require_web_session,
     resolve_json_output,
 )
+from inspire.cli.utils.tunnel_reconnect import (
+    load_ssh_public_key_material,
+    rebuild_notebook_bridge_profile,
+    retry_pause_seconds,
+    should_attempt_ssh_reconnect,
+)
 from inspire.config import ConfigError
+from inspire.cli.utils.id_resolver import is_partial_id, normalize_partial, resolve_partial_id
 from inspire.config.ssh_runtime import resolve_ssh_runtime_config
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
@@ -308,6 +316,68 @@ def _resolve_notebook_id(
 
     if _looks_like_notebook_id(identifier):
         return identifier, None
+
+    # Partial hex UUID (4+ hex chars that aren't a full UUID)
+    if is_partial_id(identifier, prefix="notebook-"):
+        partial = normalize_partial(identifier, prefix="notebook-")
+        # Gather workspace IDs for listing
+        candidates: list[str] = []
+        for ws_id in (
+            getattr(config, "workspace_cpu_id", None),
+            getattr(config, "workspace_gpu_id", None),
+            getattr(config, "workspace_internet_id", None),
+            getattr(config, "job_workspace_id", None),
+        ):
+            if ws_id:
+                candidates.append(str(ws_id))
+        workspaces_map = getattr(config, "workspaces", None)
+        if isinstance(workspaces_map, dict):
+            candidates.extend(str(v) for v in workspaces_map.values() if v)
+        if getattr(session, "workspace_id", None):
+            candidates.append(str(session.workspace_id))
+
+        workspace_ids = _unique_workspace_ids(candidates)
+        if not workspace_ids:
+            resolved_ws = None
+            try:
+                resolved_ws = select_workspace_id(config)
+            except Exception:
+                pass
+            resolved_ws = resolved_ws or getattr(session, "workspace_id", None)
+            if resolved_ws and resolved_ws != _ZERO_WORKSPACE_ID:
+                workspace_ids = [str(resolved_ws)]
+
+        if workspace_ids:
+            user_ids = _try_get_current_user_ids(session, base_url=base_url)
+            nb_matches: list[tuple[str, str]] = []
+            seen_ids: set[str] = set()
+            for ws_id in workspace_ids:
+                try:
+                    items = _list_notebooks_for_workspace(
+                        session,
+                        base_url=base_url,
+                        workspace_id=ws_id,
+                        user_ids=user_ids,
+                    )
+                except Exception:
+                    continue
+                for item in items:
+                    nid = _notebook_id_from_item(item)
+                    if not nid or nid in seen_ids:
+                        continue
+                    seen_ids.add(nid)
+                    uuid_part = nid
+                    if nid.lower().startswith("notebook-"):
+                        uuid_part = nid[9:]
+                    if uuid_part.lower().startswith(partial):
+                        label = item.get("name") or item.get("status") or ""
+                        nb_matches.append((nid, label))
+
+            if nb_matches:
+                resolved_id = resolve_partial_id(ctx, partial, "notebook", nb_matches, json_output)
+                return resolved_id, None
+
+        # No matches found — fall through to name resolution below
 
     candidates: list[str] = []
     for ws_id in (
@@ -829,23 +899,65 @@ def _print_notebook_detail(notebook: dict) -> None:
     click.echo(f"Notebook: {notebook.get('name', 'N/A')}")
     click.echo(f"{'='*60}")
 
+    project = notebook.get("project") or {}
+    quota = notebook.get("quota") or {}
+    compute_group = notebook.get("logic_compute_group") or {}
+    extra = notebook.get("extra_info") or {}
+    image = notebook.get("image") or {}
+    start_cfg = notebook.get("start_config") or {}
+    workspace = notebook.get("workspace") or {}
+    node = notebook.get("node") or {}
+
+    # GPU type: try node gpu_info first, then resource_spec fallback
+    gpu_type = ""
+    node_gpu_info = node.get("gpu_info")
+    if isinstance(node_gpu_info, dict):
+        gpu_type = node_gpu_info.get("gpu_product_simple", "")
+    if not gpu_type:
+        spec = notebook.get("resource_spec") or {}
+        gpu_type = spec.get("gpu_type", "")
+
+    gpu_count = quota.get("gpu_count", 0)
+    gpu_str = f"{gpu_count}x {gpu_type}" if gpu_type and gpu_count else str(gpu_count or "N/A")
+
+    # Image string
+    img_name = image.get("name", "")
+    img_ver = image.get("version", "")
+    img_str = f"{img_name}:{img_ver}" if img_name and img_ver else img_name or "N/A"
+
+    # Uptime from live_time (seconds)
+    live_seconds = int(notebook.get("live_time") or 0)
+    uptime = ""
+    if live_seconds > 0:
+        hours, rem = divmod(live_seconds, 3600)
+        minutes = rem // 60
+        parts = []
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        uptime = " ".join(parts) or "< 1m"
+
+    # Shared memory
+    shm = start_cfg.get("shared_memory_size", 0) or 0
+
     fields = [
-        ("ID", notebook.get("id")),
+        ("ID", notebook.get("notebook_id") or notebook.get("id")),
         ("Status", notebook.get("status")),
-        ("Project", notebook.get("project_name")),
+        ("Project", project.get("name") or notebook.get("project_name")),
+        ("Priority", project.get("priority_name")),
+        ("Compute Group", compute_group.get("name")),
+        ("Image", img_str),
+        ("GPU", gpu_str),
+        ("CPU", quota.get("cpu_count")),
+        ("Memory", f"{quota['memory_size']} GiB" if quota.get("memory_size") else None),
+        ("SHM", f"{shm} GiB" if shm else None),
+        ("Node", extra.get("NodeName") or None),
+        ("Host IP", extra.get("HostIP") or None),
+        ("Uptime", uptime or None),
+        ("Workspace", workspace.get("name")),
         ("Created", notebook.get("created_at")),
     ]
-
-    if "resource_spec" in notebook:
-        spec = notebook["resource_spec"]
-        fields.extend(
-            [
-                ("GPU Count", spec.get("gpu_count")),
-                ("GPU Type", spec.get("gpu_type")),
-                ("CPU", spec.get("cpu_count")),
-                ("Memory", spec.get("memory_size")),
-            ]
-        )
 
     for label, value in fields:
         if value:
@@ -1094,25 +1206,154 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
 
 
 def load_ssh_public_key(pubkey_path: Optional[str] = None) -> str:
-    candidates: list[Path]
+    return load_ssh_public_key_material(pubkey_path)
 
-    if pubkey_path:
-        candidates = [Path(pubkey_path).expanduser()]
-    else:
-        candidates = [
-            Path.home() / ".ssh" / "id_ed25519.pub",
-            Path.home() / ".ssh" / "id_rsa.pub",
-        ]
 
-    for path in candidates:
-        if path.exists():
-            key = path.read_text(encoding="utf-8", errors="ignore").strip()
-            if key:
-                return key
-
-    raise ValueError(
-        "No SSH public key found. Provide --pubkey PATH or generate one with 'ssh-keygen'."
+def _run_interactive_notebook_ssh_with_reconnect(
+    ctx: Context,
+    *,
+    profile_name: str,
+    tunnel_account: Optional[str],
+    session: web_session_module.WebSession,
+    pubkey: Optional[str],
+    rtunnel_bin: Optional[str],
+    debug_playwright: bool,
+    setup_timeout: int,
+    tunnel_retries: int,
+    tunnel_retry_pause: float,
+) -> None:
+    from inspire.bridge.tunnel import (
+        get_ssh_command_args,
+        is_tunnel_available,
+        load_tunnel_config,
     )
+
+    reconnect_limit = max(0, int(tunnel_retries))
+    reconnect_attempt = 0
+    ssh_public_key: Optional[str] = None
+    ssh_runtime = None
+
+    while True:
+        tunnel_config = load_tunnel_config(account=tunnel_account)
+        bridge = tunnel_config.get_bridge(profile_name)
+        if bridge is None:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                f"Bridge profile '{profile_name}' not found.",
+                EXIT_CONFIG_ERROR,
+                hint="Run 'inspire tunnel list' to check saved bridge profiles.",
+            )
+            return
+
+        args = get_ssh_command_args(bridge_name=profile_name, config=tunnel_config)
+        try:
+            returncode = subprocess.call(args)
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
+
+        if returncode == 0:
+            return
+        if not should_attempt_ssh_reconnect(returncode, interactive=True):
+            raise SystemExit(returncode if returncode is not None else 1)
+        if reconnect_attempt >= reconnect_limit:
+            _handle_error(
+                ctx,
+                "APIError",
+                "SSH connection dropped and auto-reconnect retries were exhausted.",
+                EXIT_API_ERROR,
+                hint="Re-run 'inspire notebook ssh <notebook-id>' to refresh the tunnel.",
+            )
+            return
+
+        reconnect_attempt += 1
+        click.echo(
+            (
+                "SSH connection dropped; rebuilding tunnel automatically "
+                f"(attempt {reconnect_attempt}/{reconnect_limit})..."
+            ),
+            err=True,
+        )
+
+        try:
+            if ssh_public_key is None:
+                ssh_public_key = load_ssh_public_key(pubkey)
+            if ssh_runtime is None:
+                ssh_runtime = resolve_ssh_runtime_config(
+                    cli_overrides={"rtunnel_bin": rtunnel_bin},
+                )
+            if ssh_runtime.dropbear_deb_dir and not ssh_runtime.setup_script:
+                _handle_error(
+                    ctx,
+                    "ConfigError",
+                    "Missing SSH setup script: ssh.setup_script (or INSPIRE_SETUP_SCRIPT) "
+                    "is required when ssh.dropbear_deb_dir is configured.",
+                    EXIT_CONFIG_ERROR,
+                    hint=(
+                        "Set [ssh].setup_script in config.toml or export "
+                        "INSPIRE_SETUP_SCRIPT to the setup script path on the cluster."
+                    ),
+                )
+                return
+            rebuild_notebook_bridge_profile(
+                bridge_name=profile_name,
+                bridge=bridge,
+                tunnel_config=tunnel_config,
+                session=session,
+                ssh_public_key=ssh_public_key,
+                ssh_runtime=ssh_runtime,
+                timeout=setup_timeout,
+                headless=not debug_playwright,
+            )
+        except ValueError as e:
+            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+            return
+        except ConfigError as e:
+            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+            return
+        except Exception as e:
+            if reconnect_attempt >= reconnect_limit:
+                _handle_error(
+                    ctx,
+                    "APIError",
+                    f"Failed to rebuild notebook tunnel after disconnect: {e}",
+                    EXIT_API_ERROR,
+                )
+                return
+            pause_s = retry_pause_seconds(
+                reconnect_attempt,
+                base_pause=tunnel_retry_pause,
+                progressive=True,
+            )
+            if pause_s > 0:
+                time.sleep(pause_s)
+            continue
+
+        refreshed_config = load_tunnel_config(account=tunnel_account)
+        if is_tunnel_available(
+            bridge_name=profile_name,
+            config=refreshed_config,
+            retries=3,
+            retry_pause=1.0,
+        ):
+            continue
+        if reconnect_attempt >= reconnect_limit:
+            _handle_error(
+                ctx,
+                "APIError",
+                "Tunnel rebuild completed, but SSH preflight still failed.",
+                EXIT_API_ERROR,
+                hint=f"Run 'inspire tunnel test -b {profile_name}' for diagnostics.",
+            )
+            return
+
+        pause_s = retry_pause_seconds(
+            reconnect_attempt,
+            base_pause=tunnel_retry_pause,
+            progressive=True,
+        )
+        if pause_s > 0:
+            time.sleep(pause_s)
 
 
 def run_notebook_ssh(
@@ -1224,31 +1465,63 @@ def run_notebook_ssh(
     cached_config = load_tunnel_config(account=tunnel_account)
 
     if profile_name in cached_config.bridges:
-        import subprocess
-
-        test_args = get_ssh_command_args(
-            bridge_name=profile_name,
-            config=cached_config,
-            remote_command="echo ok",
-        )
-        try:
-            result = subprocess.run(
-                test_args,
-                capture_output=True,
-                timeout=10,
-                text=True,
+        cached_bridge = cached_config.bridges[profile_name]
+        cached_notebook_id = str(getattr(cached_bridge, "notebook_id", "") or "").strip()
+        if cached_notebook_id == notebook_id:
+            test_args = get_ssh_command_args(
+                bridge_name=profile_name,
+                config=cached_config,
+                remote_command="echo ok",
             )
-            if result.returncode == 0 and "ok" in result.stdout:
-                click.echo("Using cached tunnel connection (fast path).", err=True)
-                args = get_ssh_command_args(
-                    bridge_name=profile_name,
-                    config=cached_config,
-                    remote_command=command,
+            try:
+                result = subprocess.run(
+                    test_args,
+                    capture_output=True,
+                    timeout=10,
+                    text=True,
                 )
-                os.execvp("ssh", args)
-                return
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+                if result.returncode == 0 and "ok" in result.stdout:
+                    click.echo("Using cached tunnel connection (fast path).", err=True)
+                    if command is None:
+                        _run_interactive_notebook_ssh_with_reconnect(
+                            ctx,
+                            profile_name=profile_name,
+                            tunnel_account=tunnel_account,
+                            session=session,
+                            pubkey=pubkey,
+                            rtunnel_bin=rtunnel_bin,
+                            debug_playwright=debug_playwright,
+                            setup_timeout=setup_timeout,
+                            tunnel_retries=config.tunnel_retries,
+                            tunnel_retry_pause=config.tunnel_retry_pause,
+                        )
+                        return
+                    args = get_ssh_command_args(
+                        bridge_name=profile_name,
+                        config=cached_config,
+                        remote_command=command,
+                    )
+                    os.execvp("ssh", args)
+                    return
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+        else:
+            if cached_notebook_id:
+                click.echo(
+                    (
+                        f"Bridge profile '{profile_name}' targets notebook '{cached_notebook_id}'; "
+                        f"refreshing tunnel for '{notebook_id}'."
+                    ),
+                    err=True,
+                )
+            else:
+                click.echo(
+                    (
+                        f"Bridge profile '{profile_name}' has no notebook binding metadata; "
+                        f"refreshing tunnel for '{notebook_id}'."
+                    ),
+                    err=True,
+                )
 
     try:
         ssh_public_key = load_ssh_public_key(pubkey)
@@ -1299,15 +1572,17 @@ def run_notebook_ssh(
         ssh_user="root",
         ssh_port=ssh_port,
         has_internet=has_internet,
+        notebook_id=notebook_id,
+        rtunnel_port=port,
     )
 
-    config = load_tunnel_config(account=tunnel_account)
-    config.add_bridge(bridge)
-    save_tunnel_config(config)
+    tunnel_config = load_tunnel_config(account=tunnel_account)
+    tunnel_config.add_bridge(bridge)
+    save_tunnel_config(tunnel_config)
 
     if not is_tunnel_available(
         bridge_name=profile_name,
-        config=config,
+        config=tunnel_config,
         retries=6,
         retry_pause=1.5,
     ):
@@ -1332,9 +1607,24 @@ def run_notebook_ssh(
         f"Added bridge '{profile_name}' (internet: {internet_status}, GPU: {gpu_label})", err=True
     )
 
+    if command is None:
+        _run_interactive_notebook_ssh_with_reconnect(
+            ctx,
+            profile_name=profile_name,
+            tunnel_account=tunnel_account,
+            session=session,
+            pubkey=pubkey,
+            rtunnel_bin=rtunnel_bin,
+            debug_playwright=debug_playwright,
+            setup_timeout=setup_timeout,
+            tunnel_retries=config.tunnel_retries,
+            tunnel_retry_pause=config.tunnel_retry_pause,
+        )
+        return
+
     args = get_ssh_command_args(
         bridge_name=profile_name,
-        config=config,
+        config=tunnel_config,
         remote_command=command,
     )
 

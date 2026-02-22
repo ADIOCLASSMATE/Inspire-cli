@@ -109,6 +109,36 @@ def build_rtunnel_setup_commands(
         "-o PasswordAuthentication=no -o PubkeyAuthentication=yes "
         ">/dev/null 2>&1 & fi"
     )
+    # Dropbear may die between sessions (container restart, OOM, etc.).
+    # Ensure it is running when dropbear_deb_dir is configured.
+    # Supports two layouts:
+    #  1. Extracted deb tree: $DROPBEAR_DEB_DIR/usr/sbin/dropbear exists
+    #  2. Raw .deb packages: $DROPBEAR_DEB_DIR/*.deb  (installed via dpkg -i)
+    start_dropbear_cmd = (
+        'if [ -n "${DROPBEAR_DEB_DIR:-}" ]; then '
+        'DB_BIN="$DROPBEAR_DEB_DIR/usr/sbin/dropbear"; '
+        # If extracted tree exists, set LD_LIBRARY_PATH for it
+        'if [ -x "$DB_BIN" ]; then '
+        "export LD_LIBRARY_PATH="
+        '"$DROPBEAR_DEB_DIR/lib/x86_64-linux-gnu:'
+        "$DROPBEAR_DEB_DIR/usr/lib/x86_64-linux-gnu:"
+        '${LD_LIBRARY_PATH:-}"; '
+        # If not extracted but .deb files exist, install via dpkg
+        'elif ls "$DROPBEAR_DEB_DIR"/*.deb >/dev/null 2>&1; then '
+        'dpkg -i "$DROPBEAR_DEB_DIR"/*.deb >/dev/null 2>&1 || true; '
+        "DB_BIN=/usr/sbin/dropbear; fi; "
+        # Also check system-installed dropbear as fallback
+        'if [ ! -x "$DB_BIN" ] && [ -x /usr/sbin/dropbear ]; then '
+        "DB_BIN=/usr/sbin/dropbear; fi; "
+        'if [ -x "$DB_BIN" ] && ! ps -ef | grep -q "[d]ropbear.*-p.*$SSH_PORT"; then '
+        'DB_KEY="$DROPBEAR_DEB_DIR/usr/bin/dropbearkey"; '
+        '[ -x "$DB_KEY" ] || DB_KEY=$(which dropbearkey 2>/dev/null || true); '
+        'if [ ! -f /tmp/dropbear_ed25519_host_key ] && [ -n "$DB_KEY" ] && [ -x "$DB_KEY" ]; then '
+        '"$DB_KEY" -t ed25519 -f /tmp/dropbear_ed25519_host_key >/dev/null 2>&1; fi; '
+        '"$DB_BIN" -E -s -g -p "127.0.0.1:$SSH_PORT" '
+        "-r /tmp/dropbear_ed25519_host_key -P /tmp/dropbear.pid "
+        "2>>/tmp/dropbear.log; fi; fi"
+    )
     start_rtunnel_cmd = (
         "if [ -x /tmp/rtunnel ] && ! ps -ef | "
         'grep -Eq "[r]tunnel .*([[:space:]]|:)$PORT([[:space:]]|$)"; then '
@@ -118,27 +148,28 @@ def build_rtunnel_setup_commands(
 
     if dropbear_deb_dir:
         setup_script = ssh_runtime.setup_script
-        if not setup_script:
-            raise ValueError(
-                "ssh.setup_script (or INSPIRE_SETUP_SCRIPT) is required when using "
-                "ssh.dropbear_deb_dir."
+        if setup_script:
+            cmd_lines.append(f"SETUP_SCRIPT={shlex.quote(setup_script)}")
+            cmd_lines.append(f"RTUNNEL_URL={rtunnel_download_url!r}")
+            cmd_lines.append(
+                '[ -f "$SETUP_SCRIPT" ] || echo "WARN: setup script not found: $SETUP_SCRIPT '
+                '(falling back to openssh bootstrap)"'
             )
-        cmd_lines.append(f"SETUP_SCRIPT={shlex.quote(setup_script)}")
-        cmd_lines.append(f"RTUNNEL_URL={rtunnel_download_url!r}")
-        cmd_lines.append(
-            '[ -f "$SETUP_SCRIPT" ] || echo "WARN: setup script not found: $SETUP_SCRIPT '
-            '(falling back to openssh bootstrap)"'
-        )
-        cmd_lines.append(
-            'if [ -f "$SETUP_SCRIPT" ]; then '
-            'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ]; then '
-            'bash "$SETUP_SCRIPT" "$DROPBEAR_DEB_DIR" "$RTUNNEL_BIN_PATH" '
-            '"$SSH_PORT" "$PORT" >/tmp/setup_ssh.log 2>&1; '
-            'if [ $? -eq 0 ] && [ -x /tmp/rtunnel ]; then touch "$BOOTSTRAP_SENTINEL"; '
-            'else rm -f "$BOOTSTRAP_SENTINEL"; fi; fi; '
-            f"else {openssh_bootstrap_cmd}; fi"
-        )
-        cmd_lines.append("tail -40 /tmp/setup_ssh.log 2>/dev/null || true")
+            cmd_lines.append(
+                'if [ -f "$SETUP_SCRIPT" ]; then '
+                'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ]; then '
+                'bash "$SETUP_SCRIPT" "$DROPBEAR_DEB_DIR" "$RTUNNEL_BIN_PATH" '
+                '"$SSH_PORT" "$PORT" >/tmp/setup_ssh.log 2>&1; '
+                'if [ $? -eq 0 ] && [ -x /tmp/rtunnel ]; then touch "$BOOTSTRAP_SENTINEL"; '
+                'else rm -f "$BOOTSTRAP_SENTINEL"; fi; fi; '
+                f"else {openssh_bootstrap_cmd}; fi"
+            )
+            cmd_lines.append("tail -40 /tmp/setup_ssh.log 2>/dev/null || true")
+        else:
+            # No external setup_script: use internal dpkg-based bootstrap.
+            # The start_dropbear_cmd handles dpkg -i when .deb files are found.
+            cmd_lines.append(f"RTUNNEL_URL={rtunnel_download_url!r}")
+        cmd_lines.append(start_dropbear_cmd)
         cmd_lines.append(start_sshd_cmd)
         cmd_lines.append(start_rtunnel_cmd)
     else:
@@ -361,12 +392,11 @@ def _is_rtunnel_proxy_ready(*, status: int, body: str) -> bool:
             return False
         return True
 
-    # Some deployments return a plain-text 404 from the rtunnel WebSocket server
-    # when probed with an HTTP GET. Treat that as "reachable" to avoid long
-    # waits before SSH preflight.
-    if status == 404 and text and "page not found" in text and "<html" not in text:
-        return True
-
+    # A plain-text 404 is ambiguous: it could be the platform gateway
+    # returning "route not found" for a non-existent /vscode/ path, or
+    # an rtunnel WebSocket server replying to an HTTP GET.  Treating it
+    # as ready caused false positives when the derived vscode URL didn't
+    # exist, so we no longer accept 404 as "reachable" during polling.
     return False
 
 
@@ -412,6 +442,7 @@ def wait_for_rtunnel_reachable(
     last_status = None
     last_progress_time = start
     attempt = 0
+    consecutive_404 = 0
     while time.time() - start < timeout_s:
         attempt += 1
         elapsed = time.time() - start
@@ -431,11 +462,30 @@ def wait_for_rtunnel_reachable(
                 _sys.stderr.flush()
             if _is_rtunnel_proxy_ready(status=resp.status, body=body):
                 return
+            # Track consecutive plain-text 404 responses.  Both the
+            # platform gateway and rtunnel's Go HTTP handler return this
+            # for non-WebSocket requests.  Either way the HTTP probe
+            # will never succeed, so bail out early.
+            text = (body or "").strip().lower()
+            if resp.status == 404 and "page not found" in text and "<html" not in text:
+                consecutive_404 += 1
+            else:
+                consecutive_404 = 0
         except Exception as e:
             last_status = _summarize_request_error(e)
             if attempt <= 3:
                 _sys.stderr.write(f"  Attempt {attempt}: {last_status}\n")
                 _sys.stderr.flush()
+
+        # Early-exit check is outside the try/except so the ValueError
+        # propagates to the caller instead of being swallowed.
+        if consecutive_404 >= 3 and (time.time() - start) >= 2:
+            raise ValueError(
+                f"rtunnel server returned plain-text 404 on {consecutive_404} "
+                f"consecutive attempts ({int(time.time() - start)}s elapsed).\n"
+                f"Proxy URL: {display_url}\n"
+                f"Last response: {last_status}"
+            )
 
         elapsed = time.time() - start
         if elapsed < 3:
@@ -488,11 +538,11 @@ def _is_reachable_proxy_response(*, status_code: int, body: str) -> bool:
             return False
         return True
 
-    # The rtunnel WebSocket server may return a plain-text 404 when probed
-    # with an HTTP GET. Treat that as reachable so we can skip Playwright.
-    if status_code == 404 and text and "page not found" in text and "<html" not in text:
-        return True
-
+    # A plain-text 404 is ambiguous: it could be the platform gateway
+    # returning "route not found" for a non-existent proxy path, or
+    # an rtunnel WebSocket server replying to an HTTP GET.  The false
+    # positives from gateway 404s cause broken proxy URLs to be cached
+    # and reused, so we no longer accept 404 as "reachable".
     return False
 
 
@@ -733,15 +783,27 @@ def _send_terminal_command_via_websocket(
     ws_url: str,
     command: str,
     timeout_ms: int = 5000,
+    completion_marker: str | None = None,
 ) -> bool:
+    """Send a command to a Jupyter terminal via WebSocket.
+
+    Waits for a shell prompt (``["stdout", ...]`` message) before sending
+    stdin so that the command is not lost if bash hasn't initialized yet.
+
+    When *completion_marker* is set, the function keeps the WebSocket open
+    after sending and waits until the marker string appears in a subsequent
+    stdout message.  This allows callers to block until a setup script
+    finishes (e.g. ``INSPIRE_RTUNNEL_SETUP_DONE``).
+    """
     stdin_payload = command.rstrip("\r\n") + "\r"
     try:
         return bool(
             page.evaluate(
                 """
-                async ({ wsUrl, stdinData, timeoutMs }) => {
+                async ({ wsUrl, stdinData, timeoutMs, promptTimeoutMs, marker }) => {
                   return await new Promise((resolve) => {
                     let settled = false;
+                    let sent = false;
                     let socket = null;
                     const finish = (ok) => {
                       if (settled) return;
@@ -754,6 +816,26 @@ def _send_terminal_command_via_websocket(
 
                     const timer = setTimeout(() => finish(false), timeoutMs);
 
+                    const doSend = () => {
+                      if (sent || settled) return;
+                      sent = true;
+                      try {
+                        socket.send(JSON.stringify(["stdin", stdinData]));
+                      } catch (_) {
+                        clearTimeout(timer);
+                        finish(false);
+                        return;
+                      }
+                      if (!marker) {
+                        setTimeout(() => {
+                          clearTimeout(timer);
+                          finish(true);
+                        }, 180);
+                      }
+                      // When marker is set, we keep listening for it
+                      // in the message handler below.
+                    };
+
                     try {
                       socket = new WebSocket(wsUrl);
                     } catch (_) {
@@ -762,18 +844,25 @@ def _send_terminal_command_via_websocket(
                       return;
                     }
 
-                    socket.addEventListener("open", () => {
+                    socket.addEventListener("message", (ev) => {
                       try {
-                        socket.send(JSON.stringify(["stdin", stdinData]));
-                      } catch (_) {
-                        clearTimeout(timer);
-                        finish(false);
-                        return;
-                      }
-                      setTimeout(() => {
-                        clearTimeout(timer);
-                        finish(true);
-                      }, 180);
+                        const msg = JSON.parse(ev.data);
+                        if (Array.isArray(msg) && msg[0] === "stdout") {
+                          if (!sent) {
+                            doSend();
+                          } else if (marker && String(msg[1]).includes(marker)) {
+                            clearTimeout(timer);
+                            finish(true);
+                          }
+                        }
+                      } catch (_) {}
+                    });
+
+                    socket.addEventListener("open", () => {
+                      // Wait for a stdout message (shell prompt) before
+                      // sending.  Fall back after promptTimeoutMs in case
+                      // the shell never emits a visible prompt.
+                      setTimeout(() => doSend(), promptTimeoutMs);
                     });
 
                     socket.addEventListener("error", () => {
@@ -794,6 +883,8 @@ def _send_terminal_command_via_websocket(
                     "wsUrl": ws_url,
                     "stdinData": stdin_payload,
                     "timeoutMs": int(timeout_ms),
+                    "promptTimeoutMs": min(int(timeout_ms) - 500, 3000),
+                    "marker": completion_marker or "",
                 },
             )
         )
@@ -817,6 +908,12 @@ def _send_setup_command_via_terminal_ws(
         page,
         ws_url=ws_url,
         command=batch_cmd,
+        # The setup script ends with `echo INSPIRE_RTUNNEL_SETUP_DONE`.
+        # Wait for this marker so the caller knows the script finished
+        # (dpkg -i can take 5-10s on GPU notebooks).  Use a generous
+        # timeout; the overall setup_timeout guards against hangs.
+        timeout_ms=30000,
+        completion_marker="INSPIRE_RTUNNEL_SETUP_DONE",
     )
 
 
@@ -1257,9 +1354,12 @@ def _ensure_proxy_readiness_with_fallback(
         )
         _sys.stderr.flush()
         try:
+            # Short timeout: the vscode path is speculative (derived by
+            # replacing /jupyter/ → /vscode/).  If it exists, the proxy
+            # will respond quickly; don't burn the full timeout here.
             wait_for_rtunnel_reachable(
                 proxy_url=derived_vscode_url,
-                timeout_s=max(12, min(timeout, 45)),
+                timeout_s=min(6, timeout),
                 context=context,
                 page=page,
             )
@@ -1290,8 +1390,6 @@ def _ensure_proxy_readiness_with_fallback(
         fallback_proxy_url = _build_vscode_proxy_url(page, port=port)
 
     best_for_ssh = proxy_url
-    if derived_vscode_url and derived_vscode_url != proxy_url:
-        best_for_ssh = derived_vscode_url
     if fallback_proxy_url and fallback_proxy_url != proxy_url:
         best_for_ssh = fallback_proxy_url
 
@@ -1432,11 +1530,16 @@ def _setup_notebook_rtunnel_sync(
                 page.keyboard.press("Enter")
                 timer.mark("build_and_send_cmd")
 
-            # xterm.js renders to <canvas>, so Playwright text locators are
-            # blind to terminal output.  A short fixed delay lets the setup
-            # script finish; actual readiness is verified by
-            # _ensure_proxy_readiness_with_fallback() below.
-            page.wait_for_timeout(3000)
+            # When the setup script was sent via WebSocket with a completion
+            # marker, the function already blocked until the script finished
+            # (or timed out).  Only use the fixed 3s delay for the DOM
+            # keyboard fallback where we can't observe terminal output.
+            if not setup_sent_via_ws:
+                # xterm.js renders to <canvas>, so Playwright text locators
+                # are blind to terminal output.  A short fixed delay lets
+                # the setup script finish; actual readiness is verified by
+                # _ensure_proxy_readiness_with_fallback() below.
+                page.wait_for_timeout(3000)
             timer.mark("wait_marker")
 
             try:

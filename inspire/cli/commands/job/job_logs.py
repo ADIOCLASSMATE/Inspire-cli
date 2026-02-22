@@ -38,7 +38,7 @@ from inspire.cli.context import (
 from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.auth import AuthManager
 from inspire.cli.utils.errors import exit_with_error as _handle_error
-from inspire.cli.utils.job_cli import ensure_valid_job_id
+from inspire.cli.utils.job_cli import resolve_job_id
 from inspire.config import Config, ConfigError
 
 
@@ -836,7 +836,9 @@ def _run_job_logs_single_job(
         elif refresh or not cache_path.exists():
             if not ctx.json_output:
                 click.echo(
-                    "Fetching remote log via Gitea workflow (first fetch may take ~10-30s)..."
+                    "Fetching remote log via Gitea workflow "
+                    "(deprecated -- will be removed in a future release; "
+                    "first fetch may take ~10-30s)..."
                 )
 
             try:
@@ -976,8 +978,7 @@ def logs(
         _bulk_update_logs(ctx, status=status, limit=limit, refresh=refresh)
         return
 
-    if not ensure_valid_job_id(ctx, job_id):
-        return
+    job_id = resolve_job_id(ctx, job_id)
 
     _run_job_logs_single_job(
         ctx,
