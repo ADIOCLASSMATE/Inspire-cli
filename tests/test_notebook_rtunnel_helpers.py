@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import pytest
 
 from inspire.platform.web.browser_api import rtunnel as rtunnel_module
 from inspire.platform.web.browser_api.rtunnel import (
+    _CONTENTS_API_RTUNNEL_FILENAME,
     _StepTimer,
     _build_batch_setup_script,
     _build_terminal_websocket_url,
     _create_terminal_via_api,
+    _delete_terminal_via_api,
+    _download_rtunnel_locally,
     _extract_jupyter_token,
     _focus_terminal_input,
     _jupyter_server_base,
     _open_or_create_terminal,
+    _send_setup_command_via_terminal_ws,
     _send_terminal_command_via_websocket,
+    _upload_rtunnel_via_contents_api,
+    _verify_terminal_focus,
+    _wait_for_setup_completion,
     _wait_for_terminal_surface,
     _wait_for_terminal_surface_progressive,
 )
@@ -145,6 +153,63 @@ def test_create_terminal_via_api_proxy_url() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _delete_terminal_via_api
+# ---------------------------------------------------------------------------
+
+
+class _DummyDeleteRequest:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.calls: list[tuple[str, dict | None, int]] = []
+
+    def delete(self, url: str, headers: dict | None = None, timeout: int = 0) -> _DummyResponse:
+        self.calls.append((url, headers, timeout))
+        return _DummyResponse(self.status, {})
+
+
+class _DummyDeleteContext:
+    def __init__(self, request: _DummyDeleteRequest, cookies: list[dict] | None = None) -> None:
+        self.request = request
+        self._cookies = cookies or []
+
+    def cookies(self) -> list[dict]:
+        return self._cookies
+
+
+def test_delete_terminal_via_api_success_with_xsrf_header() -> None:
+    request = _DummyDeleteRequest(status=204)
+    ctx = _DummyDeleteContext(
+        request,
+        cookies=[{"name": "_xsrf", "value": "token-123"}],
+    )
+
+    assert (
+        _delete_terminal_via_api(ctx, lab_url="https://nb.example.com/lab", term_name="7") is True
+    )
+    assert len(request.calls) == 1
+    assert request.calls[0][0] == "https://nb.example.com/api/terminals/7"
+    assert request.calls[0][1] == {"X-XSRFToken": "token-123"}
+
+
+def test_delete_terminal_via_api_404_is_treated_as_success() -> None:
+    request = _DummyDeleteRequest(status=404)
+    ctx = _DummyDeleteContext(request)
+
+    assert (
+        _delete_terminal_via_api(ctx, lab_url="https://nb.example.com/lab", term_name="7") is True
+    )
+
+
+def test_delete_terminal_via_api_failure_status() -> None:
+    request = _DummyDeleteRequest(status=500)
+    ctx = _DummyDeleteContext(request)
+
+    assert (
+        _delete_terminal_via_api(ctx, lab_url="https://nb.example.com/lab", term_name="7") is False
+    )
+
+
+# ---------------------------------------------------------------------------
 # websocket url/token helpers
 # ---------------------------------------------------------------------------
 
@@ -233,6 +298,89 @@ def test_send_terminal_command_via_websocket_playwright_exception() -> None:
     assert result is False
 
 
+def test_send_setup_command_via_terminal_ws_cleans_up_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    class _Frame:
+        url = "https://nb.example.com/lab"
+
+    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
+    monkeypatch.setattr(
+        rtunnel_module,
+        "_build_terminal_websocket_url",
+        lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-1",
+    )
+    monkeypatch.setattr(
+        rtunnel_module,
+        "_send_terminal_command_via_websocket",
+        lambda *_a, **_k: events.append(("send", "ok")) or True,
+    )
+    monkeypatch.setattr(
+        rtunnel_module,
+        "_delete_terminal_via_api",
+        lambda _ctx, *, lab_url, term_name: events.append(("delete", f"{lab_url}|{term_name}"))
+        or True,
+    )
+
+    assert (
+        _send_setup_command_via_terminal_ws(context=object(), lab_frame=_Frame(), batch_cmd="echo")
+        is True
+    )
+    assert ("send", "ok") in events
+    assert ("delete", "https://nb.example.com/lab|term-1") in events
+
+
+def test_send_setup_command_via_terminal_ws_cleans_up_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _Frame:
+        url = "https://nb.example.com/lab"
+
+    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: "term-2")
+    monkeypatch.setattr(
+        rtunnel_module,
+        "_build_terminal_websocket_url",
+        lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-2",
+    )
+    monkeypatch.setattr(
+        rtunnel_module, "_send_terminal_command_via_websocket", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        rtunnel_module,
+        "_delete_terminal_via_api",
+        lambda *_a, **_k: events.append("deleted") or True,
+    )
+
+    assert (
+        _send_setup_command_via_terminal_ws(
+            context=object(),
+            lab_frame=_Frame(),
+            batch_cmd="echo",
+        )
+        is False
+    )
+    assert events == ["deleted"]
+
+
+def test_send_setup_command_via_terminal_ws_returns_false_when_terminal_create_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: None)
+
+    assert (
+        _send_setup_command_via_terminal_ws(
+            context=object(),
+            lab_frame=type("_Frame", (), {"url": "https://nb.example.com/lab"})(),
+            batch_cmd="echo",
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # terminal surface and focus helpers
 # ---------------------------------------------------------------------------
@@ -244,9 +392,11 @@ class _LocatorStub:
         *,
         count: int = 0,
         wait_ok: bool = False,
+        visible: bool = False,
     ) -> None:
         self._count = count
         self._wait_ok = wait_ok
+        self._visible = visible
         self.first = self
         self.wait_calls: list[tuple[str, int]] = []
         self.click_calls: list[int] = []
@@ -254,21 +404,37 @@ class _LocatorStub:
     def count(self) -> int:
         return self._count
 
+    def is_visible(self, timeout: int = 0) -> bool:
+        return self._visible
+
     def wait_for(self, *, state: str, timeout: int) -> None:
         self.wait_calls.append((state, timeout))
         if not self._wait_ok:
             raise TimeoutError("not ready")
 
-    def click(self, timeout: int = 0) -> None:
+    def click(self, timeout: int = 0, force: bool = False) -> None:
         self.click_calls.append(timeout)
 
 
 class _FrameStub:
-    def __init__(self, selectors: dict[str, _LocatorStub]) -> None:
+    def __init__(
+        self,
+        selectors: dict[str, _LocatorStub],
+        evaluate_results: list[object] | None = None,
+    ) -> None:
         self._selectors = selectors
+        self._evaluate_results = list(evaluate_results) if evaluate_results else []
+        self._evaluate_idx = 0
 
     def locator(self, selector: str) -> _LocatorStub:
         return self._selectors.setdefault(selector, _LocatorStub())
+
+    def evaluate(self, expression: str) -> object:
+        if self._evaluate_idx < len(self._evaluate_results):
+            result = self._evaluate_results[self._evaluate_idx]
+            self._evaluate_idx += 1
+            return result
+        return None
 
 
 class _PageStub:
@@ -378,15 +544,106 @@ def test_wait_for_terminal_surface_progressive_timeout(monkeypatch: pytest.Monke
     assert fake_time[0] > 0.0
 
 
-def test_focus_terminal_input_clicks_first_textarea() -> None:
-    text_area = _LocatorStub(count=1, wait_ok=True)
-    frame = _FrameStub({"textarea.xterm-helper-textarea": text_area})
+def test_verify_terminal_focus_true() -> None:
+    frame = _FrameStub({}, evaluate_results=["textarea", "xterm-helper-textarea"])
+    assert _verify_terminal_focus(frame) is True
+
+
+def test_verify_terminal_focus_wrong_tag() -> None:
+    frame = _FrameStub({}, evaluate_results=["div", "xterm-helper-textarea"])
+    assert _verify_terminal_focus(frame) is False
+
+
+def test_verify_terminal_focus_wrong_class() -> None:
+    frame = _FrameStub({}, evaluate_results=["textarea", "some-other-class"])
+    assert _verify_terminal_focus(frame) is False
+
+
+def test_verify_terminal_focus_exception() -> None:
+    class _BrokenFrame:
+        def evaluate(self, _expr: str) -> object:
+            raise RuntimeError("frame detached")
+
+    assert _verify_terminal_focus(_BrokenFrame()) is False
+
+
+def test_focus_terminal_input_succeeds_via_xterm_container() -> None:
+    """Focus via .xterm container click when it's visible and focus verifies."""
+    xterm = _LocatorStub(count=1, visible=True)
+    textarea = _LocatorStub(wait_ok=True)
+    # evaluate returns: tagName="textarea", className="xterm-helper-textarea"
+    frame = _FrameStub(
+        {".xterm": xterm, "textarea.xterm-helper-textarea": textarea},
+        evaluate_results=["textarea", "xterm-helper-textarea"],
+    )
     page = _PageStub()
 
     assert _focus_terminal_input(frame, page) is True
-    assert len(text_area.click_calls) == 1
-    assert text_area.click_calls[0] > 0
+    assert len(xterm.click_calls) == 1
     assert 40 in page.wait_calls
+
+
+def test_focus_terminal_input_succeeds_via_force_click_textarea() -> None:
+    """When .xterm click doesn't verify focus, atomic JS focus path succeeds."""
+    # .xterm verify fails (2 evaluates), then atomic JS returns True (1 evaluate).
+    textarea = _LocatorStub(wait_ok=True)
+    frame = _FrameStub(
+        {".xterm": _LocatorStub(count=1), "textarea.xterm-helper-textarea": textarea},
+        evaluate_results=["div", "", True],
+    )
+    page = _PageStub()
+
+    assert _focus_terminal_input(frame, page) is True
+
+
+def test_focus_terminal_input_returns_false_when_focus_never_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returns False when both focus strategies fail on all passes."""
+    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_a, **_kw: False)
+
+    # Per pass: .xterm verify consumes 2 evaluates, atomic JS consumes 1.
+    # "div", "" → verify fails; False → atomic JS returns falsy.
+    textarea = _LocatorStub(wait_ok=True)
+    frame = _FrameStub(
+        {".xterm": _LocatorStub(count=1), "textarea.xterm-helper-textarea": textarea},
+        evaluate_results=["div", "", False] * 5,
+    )
+    page = _PageStub()
+
+    assert _focus_terminal_input(frame, page) is False
+
+
+def test_focus_terminal_input_succeeds_via_atomic_js_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Atomic JS focus succeeds when .xterm click path fails."""
+    monkeypatch.setattr(rtunnel_module, "_click_terminal_tab", lambda *_a, **_kw: False)
+
+    # .xterm count=0 (Try 1 skipped), atomic JS returns True
+    textarea = _LocatorStub(wait_ok=True)
+    frame = _FrameStub(
+        {".xterm": _LocatorStub(count=0), "textarea.xterm-helper-textarea": textarea},
+        evaluate_results=[True],
+    )
+    page = _PageStub()
+
+    assert _focus_terminal_input(frame, page) is True
+
+
+def test_focus_terminal_input_returns_false_when_textarea_not_attached() -> None:
+    """Returns False immediately when xterm textarea hasn't been created yet."""
+    textarea = _LocatorStub(wait_ok=False)  # textarea not yet attached
+    xterm = _LocatorStub(count=1, wait_ok=True)
+    frame = _FrameStub(
+        {".xterm": xterm, "textarea.xterm-helper-textarea": textarea},
+        evaluate_results=["textarea", "xterm-helper-textarea"],
+    )
+    page = _PageStub()
+
+    assert _focus_terminal_input(frame, page) is False
+    # Should not have attempted any clicks (gate failed before retry loop)
+    assert len(xterm.click_calls) == 0
 
 
 def test_focus_terminal_input_returns_false_when_unavailable() -> None:
@@ -404,7 +661,7 @@ def test_open_or_create_terminal_returns_early_when_api_path_succeeds(
     monkeypatch.setattr(
         rtunnel_module,
         "_open_terminal_via_rest_api",
-        lambda **_kwargs: (True, True),
+        lambda **_kwargs: (True, True, "api-1"),
     )
     monkeypatch.setattr(
         rtunnel_module,
@@ -422,7 +679,11 @@ def test_open_or_create_terminal_returns_early_when_api_path_succeeds(
         lambda **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or True,
     )
 
-    assert _open_or_create_terminal(context=object(), page=object(), lab_frame=object()) is True
+    result, term_name = _open_or_create_terminal(
+        context=object(), page=object(), lab_frame=object()
+    )
+    assert result is True
+    assert term_name == "api-1"
     assert calls["recover"] == 0
     assert calls["entry"] == 0
     assert calls["fallback"] == 0
@@ -436,7 +697,7 @@ def test_open_or_create_terminal_uses_dom_fallback_after_api_recovery_miss(
     monkeypatch.setattr(
         rtunnel_module,
         "_open_terminal_via_rest_api",
-        lambda **_kwargs: (False, True),
+        lambda **_kwargs: (False, True, "api-2"),
     )
     monkeypatch.setattr(
         rtunnel_module,
@@ -464,7 +725,11 @@ def test_open_or_create_terminal_uses_dom_fallback_after_api_recovery_miss(
         lambda *_args, **kwargs: events.append(("tab_click", kwargs["settle_ms"])) or True,
     )
 
-    assert _open_or_create_terminal(context=object(), page=object(), lab_frame=object()) is True
+    result, term_name = _open_or_create_terminal(
+        context=object(), page=object(), lab_frame=object()
+    )
+    assert result is True
+    assert term_name == "api-2"
     assert ("entry", True) in events
     assert ("tab_click", 80) in events
 
@@ -475,7 +740,7 @@ def test_open_or_create_terminal_handles_api_full_failure(
     events: list[tuple[str, object]] = []
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False)
+        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
     )
     monkeypatch.setattr(
         rtunnel_module,
@@ -489,7 +754,11 @@ def test_open_or_create_terminal_handles_api_full_failure(
         lambda **kwargs: events.append(("fallback", kwargs["api_term_created"])) or True,
     )
 
-    assert _open_or_create_terminal(context=object(), page=object(), lab_frame=object()) is True
+    result, term_name = _open_or_create_terminal(
+        context=object(), page=object(), lab_frame=object()
+    )
+    assert result is True
+    assert term_name is None
     assert ("entry", False) in events
     assert ("fallback", False) in events
 
@@ -500,7 +769,7 @@ def test_open_or_create_terminal_returns_false_when_dom_fallback_fails(
     calls = {"tab_click": 0}
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False)
+        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, False, None)
     )
     monkeypatch.setattr(rtunnel_module, "_wait_for_terminal_entry_point", lambda **_kwargs: None)
     monkeypatch.setattr(rtunnel_module, "_dismiss_terminal_dialog_once", lambda **_kwargs: False)
@@ -511,7 +780,11 @@ def test_open_or_create_terminal_returns_false_when_dom_fallback_fails(
         lambda *_args, **_kwargs: calls.__setitem__("tab_click", calls["tab_click"] + 1) or True,
     )
 
-    assert _open_or_create_terminal(context=object(), page=object(), lab_frame=object()) is False
+    result, term_name = _open_or_create_terminal(
+        context=object(), page=object(), lab_frame=object()
+    )
+    assert result is False
+    assert term_name is None
     assert calls["tab_click"] == 0
 
 
@@ -521,7 +794,7 @@ def test_open_or_create_terminal_returns_true_when_api_recovery_succeeds(
     calls = {"entry": 0, "fallback": 0}
 
     monkeypatch.setattr(
-        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, True)
+        rtunnel_module, "_open_terminal_via_rest_api", lambda **_kwargs: (False, True, "api-5")
     )
     monkeypatch.setattr(rtunnel_module, "_recover_api_terminal_surface", lambda **_kwargs: True)
     monkeypatch.setattr(
@@ -535,7 +808,11 @@ def test_open_or_create_terminal_returns_true_when_api_recovery_succeeds(
         lambda **_kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or True,
     )
 
-    assert _open_or_create_terminal(context=object(), page=object(), lab_frame=object()) is True
+    result, term_name = _open_or_create_terminal(
+        context=object(), page=object(), lab_frame=object()
+    )
+    assert result is True
+    assert term_name == "api-5"
     assert calls["entry"] == 0
     assert calls["fallback"] == 0
 
@@ -551,13 +828,16 @@ def test_open_terminal_via_rest_api_handles_playwright_navigation_error(
         def goto(self, *_args, **_kwargs) -> None:
             raise rtunnel_module.PlaywrightError("navigation failed")
 
-    terminal_ready, api_term_created = rtunnel_module._open_terminal_via_rest_api(  # noqa: SLF001
-        context=object(),
-        page=object(),
-        lab_frame=_Frame(),
+    terminal_ready, api_term_created, term_name = (
+        rtunnel_module._open_terminal_via_rest_api(  # noqa: SLF001
+            context=object(),
+            page=object(),
+            lab_frame=_Frame(),
+        )
     )
     assert terminal_ready is False
     assert api_term_created is True
+    assert term_name == "1"
 
 
 def test_recover_api_terminal_surface_waits_for_menu_before_file_menu_fallback(
@@ -633,6 +913,47 @@ def test_build_batch_setup_script_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _wait_for_setup_completion
+# ---------------------------------------------------------------------------
+
+
+class _TimerStub:
+    def __init__(self) -> None:
+        self.labels: list[str] = []
+
+    def mark(self, label: str) -> None:
+        self.labels.append(label)
+
+
+class _WaitPageStub:
+    def __init__(self) -> None:
+        self.wait_calls: list[int] = []
+
+    def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.wait_calls.append(timeout_ms)
+
+
+def test_wait_for_setup_completion_uses_short_settle_for_ws_path() -> None:
+    page = _WaitPageStub()
+    timer = _TimerStub()
+
+    _wait_for_setup_completion(page=page, setup_sent_via_ws=True, timer=timer)
+
+    assert page.wait_calls == [500]
+    assert timer.labels == ["wait_marker"]
+
+
+def test_wait_for_setup_completion_uses_longer_settle_for_browser_path() -> None:
+    page = _WaitPageStub()
+    timer = _TimerStub()
+
+    _wait_for_setup_completion(page=page, setup_sent_via_ws=False, timer=timer)
+
+    assert page.wait_calls == [3000]
+    assert timer.labels == ["wait_marker"]
+
+
+# ---------------------------------------------------------------------------
 # _StepTimer
 # ---------------------------------------------------------------------------
 
@@ -685,3 +1006,189 @@ def test_step_timer_summary_empty_when_no_steps(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# _upload_rtunnel_via_contents_api
+# ---------------------------------------------------------------------------
+
+
+class _DummyUploadResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class _DummyUploadRequest:
+    def __init__(self, response: _DummyUploadResponse) -> None:
+        self._response = response
+        self.calls: list[tuple[str, dict | None, dict | None, int]] = []
+
+    def put(
+        self,
+        url: str,
+        headers: dict | None = None,
+        data: dict | None = None,
+        timeout: int = 0,
+    ) -> _DummyUploadResponse:
+        self.calls.append((url, headers, data, timeout))
+        return self._response
+
+
+class _DummyUploadContext:
+    def __init__(self, request: _DummyUploadRequest) -> None:
+        self.request = request
+
+    def cookies(self) -> list[dict]:
+        return []
+
+
+def test_upload_rtunnel_via_contents_api_success(tmp_path: Path) -> None:
+    binary = tmp_path / "rtunnel"
+    binary.write_bytes(b"\x7fELF_test_binary")
+
+    resp = _DummyUploadResponse(201)
+    req = _DummyUploadRequest(resp)
+    ctx = _DummyUploadContext(req)
+
+    result = _upload_rtunnel_via_contents_api(ctx, "https://nb.example.com/lab", binary)
+    assert result is True
+    assert len(req.calls) == 1
+
+    url, _headers, data, timeout = req.calls[0]
+    assert url == f"https://nb.example.com/api/contents/{_CONTENTS_API_RTUNNEL_FILENAME}"
+    assert data["type"] == "file"
+    assert data["format"] == "base64"
+    # Verify the payload round-trips
+    import base64 as _b64
+
+    assert _b64.b64decode(data["content"]) == b"\x7fELF_test_binary"
+    assert timeout == 30000
+
+
+def test_upload_rtunnel_via_contents_api_failure_status(tmp_path: Path) -> None:
+    binary = tmp_path / "rtunnel"
+    binary.write_bytes(b"\x7fELF")
+
+    resp = _DummyUploadResponse(500)
+    req = _DummyUploadRequest(resp)
+    ctx = _DummyUploadContext(req)
+
+    result = _upload_rtunnel_via_contents_api(ctx, "https://nb.example.com/lab", binary)
+    assert result is False
+
+
+def test_upload_rtunnel_via_contents_api_missing_binary() -> None:
+    resp = _DummyUploadResponse(201)
+    req = _DummyUploadRequest(resp)
+    ctx = _DummyUploadContext(req)
+
+    result = _upload_rtunnel_via_contents_api(
+        ctx, "https://nb.example.com/lab", Path("/nonexistent/rtunnel")
+    )
+    assert result is False
+    assert len(req.calls) == 0
+
+
+def test_upload_rtunnel_via_contents_api_network_error(tmp_path: Path) -> None:
+    binary = tmp_path / "rtunnel"
+    binary.write_bytes(b"\x7fELF")
+
+    class _BrokenUploadRequest:
+        def put(self, url: str, **kwargs: object) -> None:
+            raise ConnectionError("network failure")
+
+    ctx = _DummyUploadContext(_BrokenUploadRequest())  # type: ignore[arg-type]
+
+    result = _upload_rtunnel_via_contents_api(ctx, "https://nb.example.com/lab", binary)
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _download_rtunnel_locally
+# ---------------------------------------------------------------------------
+
+
+def test_download_rtunnel_locally_success(tmp_path: Path) -> None:
+    import tarfile
+
+    # Build a valid .tar.gz containing a file named "rtunnel"
+    binary_content = b"\x7fELF_fake_rtunnel"
+    tar_path = tmp_path / "rtunnel.tar.gz"
+    member_path = tmp_path / "rtunnel"
+    member_path.write_bytes(binary_content)
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+        tar.add(str(member_path), arcname="rtunnel")
+
+    dest = tmp_path / "output" / "rtunnel"
+
+    import shutil
+    import urllib.request
+
+    original_urlretrieve = urllib.request.urlretrieve
+
+    def fake_urlretrieve(url: str, filename: str) -> tuple:
+        shutil.copy2(str(tar_path), filename)
+        return (filename, None)
+
+    urllib.request.urlretrieve = fake_urlretrieve  # type: ignore[assignment]
+    try:
+        result = _download_rtunnel_locally("https://example.com/rtunnel.tar.gz", dest)
+    finally:
+        urllib.request.urlretrieve = original_urlretrieve  # type: ignore[assignment]
+
+    assert result is True
+    assert dest.exists()
+    assert dest.read_bytes() == binary_content
+    assert dest.stat().st_mode & 0o755
+
+
+def test_download_rtunnel_locally_network_error(tmp_path: Path) -> None:
+    import urllib.error
+    import urllib.request
+
+    dest = tmp_path / "rtunnel"
+
+    original_urlretrieve = urllib.request.urlretrieve
+
+    def broken_urlretrieve(url: str, filename: str) -> None:
+        raise urllib.error.URLError("network failure")
+
+    urllib.request.urlretrieve = broken_urlretrieve  # type: ignore[assignment]
+    try:
+        result = _download_rtunnel_locally("https://example.com/rtunnel.tar.gz", dest)
+    finally:
+        urllib.request.urlretrieve = original_urlretrieve  # type: ignore[assignment]
+
+    assert result is False
+    assert not dest.exists()
+
+
+def test_download_rtunnel_locally_no_rtunnel_in_archive(tmp_path: Path) -> None:
+    import tarfile
+
+    # Build a .tar.gz with no file named "rtunnel"
+    tar_path = tmp_path / "bad.tar.gz"
+    other_file = tmp_path / "other.txt"
+    other_file.write_text("not rtunnel")
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+        tar.add(str(other_file), arcname="other.txt")
+
+    dest = tmp_path / "output" / "rtunnel"
+
+    import shutil
+    import urllib.request
+
+    original_urlretrieve = urllib.request.urlretrieve
+
+    def fake_urlretrieve(url: str, filename: str) -> tuple:
+        shutil.copy2(str(tar_path), filename)
+        return (filename, None)
+
+    urllib.request.urlretrieve = fake_urlretrieve  # type: ignore[assignment]
+    try:
+        result = _download_rtunnel_locally("https://example.com/rtunnel.tar.gz", dest)
+    finally:
+        urllib.request.urlretrieve = original_urlretrieve  # type: ignore[assignment]
+
+    assert result is False
+    assert not dest.exists()

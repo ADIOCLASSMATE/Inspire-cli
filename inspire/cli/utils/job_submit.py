@@ -70,6 +70,12 @@ def select_project_for_workspace(
     if not projects:
         raise ConfigError("No projects available")
 
+    congested = browser_api_module.check_scheduling_health(
+        workspace_id=workspace_id,
+        project_ids={p.project_id for p in projects},
+        session=session,
+    )
+
     requested_value = requested
     if not requested_value and not config.project_order:
         requested_value = config.job_project_id
@@ -89,6 +95,7 @@ def select_project_for_workspace(
         requested_value,
         shared_path_group_by_id=shared_groups,
         project_order=config.project_order or None,
+        congested_projects=congested or None,
     )
 
 
@@ -100,6 +107,7 @@ def cache_created_job(
     resource: str,
     command: str,
     log_path: str | None,
+    project: str | None = None,
 ) -> None:
     cache = JobCache(config.get_expanded_cache_path())
     cache.add_job(
@@ -109,6 +117,7 @@ def cache_created_job(
         command=command,
         status="PENDING",
         log_path=log_path,
+        project=project,
     )
 
 
@@ -127,6 +136,7 @@ def submit_training_job(
     priority: int,
     nodes: int,
     max_time_hours: float,
+    project_name: Optional[str] = None,
 ) -> JobSubmission:
     wrapped_command = wrap_in_bash(command)
     final_command, log_path = build_remote_logged_command(config, command=wrapped_command)
@@ -167,6 +177,7 @@ def submit_training_job(
             resource=resource,
             command=wrapped_command,
             log_path=log_path,
+            project=project_name,
         )
 
     return JobSubmission(
