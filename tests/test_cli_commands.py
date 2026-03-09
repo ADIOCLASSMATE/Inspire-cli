@@ -7,26 +7,23 @@ from click.testing import CliRunner
 
 from inspire.cli.main import main as cli_main
 from inspire.cli.context import (
-    Context,
     EXIT_SUCCESS,
-    EXIT_API_ERROR,
     EXIT_CONFIG_ERROR,
     EXIT_AUTH_ERROR,
     EXIT_GENERAL_ERROR,
     EXIT_TIMEOUT,
     EXIT_LOG_NOT_FOUND,
     EXIT_JOB_NOT_FOUND,
+    EXIT_VALIDATION_ERROR,
 )
 
 from inspire import config as config_module
 from inspire.bridge import tunnel as tunnel_module
-from inspire.cli.commands.notebook import notebook_commands as notebook_cmd_module
 from inspire.cli.utils import auth as auth_module
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web import session as web_session_module
 from inspire.cli.utils.auth import AuthenticationError
 from inspire.config import ConfigError
-from inspire.config.ssh_runtime import SshRuntimeConfig
 from inspire.cli.utils.job_cache import JobCache
 from inspire.platform.openapi import ResourceManager
 
@@ -803,7 +800,7 @@ def test_job_logs_legacy_filename_is_migrated(monkeypatch: pytest.MonkeyPatch, t
 
 
 def test_job_logs_missing_file_sets_exit_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # Config.from_env will succeed but LogReader will return no file
+    # Config.from_env will succeed but cache has no log_path for this job.
     patch_config_and_auth(monkeypatch, tmp_path)
 
     # Add job to cache WITHOUT log_path to test the "log not found" path
@@ -849,7 +846,7 @@ def test_job_logs_follow_json_skips_ssh_follow_path(
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
     called = {"workflow_follow": False}
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda: True)
+    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         job_logs_module,
         "_follow_logs_via_ssh",
@@ -889,13 +886,233 @@ def test_job_logs_follow_returns_follow_exit_code(
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda: False)
+    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
     monkeypatch.setattr(job_logs_module, "_follow_logs", lambda *args, **kwargs: EXIT_GENERAL_ERROR)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--follow"])
 
     assert result.exit_code == EXIT_GENERAL_ERROR
+
+
+def test_job_logs_bridge_option_uses_named_tunnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_config_and_auth(monkeypatch, tmp_path)
+
+    config = make_test_config(tmp_path)
+    cache = JobCache(config.get_expanded_cache_path())
+    remote_log_path = f"/train/logs/.inspire/training_master_{TEST_JOB_ID}.log"
+    cache.add_job(
+        job_id=TEST_JOB_ID,
+        name="test-job",
+        resource="H200",
+        command="echo test",
+        status="RUNNING",
+        log_path=remote_log_path,
+    )
+
+    from importlib import import_module
+
+    job_logs_module = import_module("inspire.cli.commands.job.job_logs")
+    observed: dict[str, str | None] = {"checked": None, "fetched": None}
+
+    def fake_tunnel_available(*args, **kwargs):  # noqa: ANN002, ANN003
+        observed["checked"] = kwargs.get("bridge_name")
+        return True
+
+    def fake_fetch_log(*args, **kwargs):  # noqa: ANN002, ANN003
+        observed["fetched"] = kwargs.get("bridge_name")
+        return "ssh fast path content"
+
+    monkeypatch.setattr(job_logs_module, "is_tunnel_available", fake_tunnel_available)
+    monkeypatch.setattr(job_logs_module, "_fetch_log_via_ssh", fake_fetch_log)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--bridge", "gpu-main"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert observed["checked"] == "gpu-main"
+    assert observed["fetched"] == "gpu-main"
+    assert "ssh fast path content" in result.output
+
+
+def test_job_logs_bridge_requires_job_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    patch_config_and_auth(monkeypatch, tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["job", "logs", "--bridge", "gpu-main"])
+
+    assert result.exit_code == EXIT_VALIDATION_ERROR
+    assert "--bridge require a JOB_ID" in result.output
+
+
+def test_job_logs_fallback_mentions_connected_bridge_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    patch_config_and_auth(monkeypatch, tmp_path)
+
+    config = make_test_config(tmp_path)
+    cache = JobCache(config.get_expanded_cache_path())
+    remote_log_path = f"/train/logs/.inspire/training_master_{TEST_JOB_ID}.log"
+    cache.add_job(
+        job_id=TEST_JOB_ID,
+        name="test-job",
+        resource="H200",
+        command="echo test",
+        status="RUNNING",
+        log_path=remote_log_path,
+    )
+
+    local_cache_dir = Path(config.log_cache_dir)
+    local_cache_dir.mkdir(parents=True, exist_ok=True)
+    local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
+    local_log_path.write_text("cached log content\n", encoding="utf-8")
+
+    from importlib import import_module
+
+    job_logs_module = import_module("inspire.cli.commands.job.job_logs")
+    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        job_logs_module,
+        "_find_connected_tunnel_bridges",
+        lambda exclude=None, timeout=5: ["gpu-main"],  # noqa: ARG005
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID])
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert "Tunnel default bridge not available" in result.output
+    assert "Connected tunnel profile(s): gpu-main" in result.output
+    assert "may not share the same remote directory/log path" in result.output
+
+
+def test_job_logs_fail_fast_when_default_bridge_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    patch_config_and_auth(monkeypatch, tmp_path)
+
+    config = make_test_config(tmp_path)
+    cache = JobCache(config.get_expanded_cache_path())
+    remote_log_path = f"/train/logs/.inspire/training_master_{TEST_JOB_ID}.log"
+    cache.add_job(
+        job_id=TEST_JOB_ID,
+        name="test-job",
+        resource="H200",
+        command="echo test",
+        status="RUNNING",
+        log_path=remote_log_path,
+    )
+
+    from importlib import import_module
+
+    job_deps = import_module("inspire.cli.commands.job.job_deps")
+    job_logs_module = import_module("inspire.cli.commands.job.job_logs")
+
+    fake_tunnel_config = tunnel_module.TunnelConfig(
+        bridges={
+            "gpu-main": tunnel_module.BridgeProfile(
+                name="gpu-main",
+                proxy_url="https://proxy.example.invalid",
+            )
+        },
+        default_bridge="gpu-main",
+    )
+
+    called = {"fetch_remote_log": False}
+
+    def fake_fetch(*args, **kwargs):  # noqa: ANN002, ANN003
+        called["fetch_remote_log"] = True
+
+    monkeypatch.setattr(job_logs_module, "load_tunnel_config", lambda: fake_tunnel_config)
+    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--tail", "80"])
+
+    assert result.exit_code == EXIT_GENERAL_ERROR
+    assert "SSH tunnel not available for bridge 'gpu-main'" in result.output
+    assert called["fetch_remote_log"] is False
+
+
+def test_tunnel_list_places_connected_bridges_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    from importlib import import_module
+
+    list_cmd_module = import_module("inspire.cli.commands.tunnel.list_cmd")
+
+    config = tunnel_module.TunnelConfig(
+        bridges={
+            "zeta": tunnel_module.BridgeProfile(name="zeta", proxy_url="https://zeta.example.com"),
+            "alpha": tunnel_module.BridgeProfile(
+                name="alpha", proxy_url="https://alpha.example.com"
+            ),
+            "beta": tunnel_module.BridgeProfile(name="beta", proxy_url="https://beta.example.com"),
+        },
+        default_bridge="beta",
+    )
+
+    monkeypatch.setattr(list_cmd_module, "load_tunnel_config", lambda: config)
+    monkeypatch.setattr(
+        list_cmd_module,
+        "_check_bridges",
+        lambda bridges, config, timeout=5: {  # noqa: ARG005
+            "zeta": False,
+            "alpha": True,
+            "beta": False,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["tunnel", "list"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    alpha_pos = result.output.find("  alpha:")
+    beta_pos = result.output.find("* beta:")
+    zeta_pos = result.output.find("  zeta:")
+    assert alpha_pos != -1 and beta_pos != -1 and zeta_pos != -1
+    assert alpha_pos < beta_pos
+    assert alpha_pos < zeta_pos
+
+
+def test_tunnel_list_json_places_connected_bridges_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    from importlib import import_module
+
+    list_cmd_module = import_module("inspire.cli.commands.tunnel.list_cmd")
+
+    config = tunnel_module.TunnelConfig(
+        bridges={
+            "zeta": tunnel_module.BridgeProfile(name="zeta", proxy_url="https://zeta.example.com"),
+            "alpha": tunnel_module.BridgeProfile(
+                name="alpha", proxy_url="https://alpha.example.com"
+            ),
+            "beta": tunnel_module.BridgeProfile(name="beta", proxy_url="https://beta.example.com"),
+        },
+        default_bridge="beta",
+    )
+
+    monkeypatch.setattr(list_cmd_module, "load_tunnel_config", lambda: config)
+    monkeypatch.setattr(
+        list_cmd_module,
+        "_check_bridges",
+        lambda bridges, config, timeout=5: {  # noqa: ARG005
+            "zeta": False,
+            "alpha": True,
+            "beta": False,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli_main, ["--json", "tunnel", "list"])
+
+    assert result.exit_code == EXIT_SUCCESS
+    payload = json.loads(result.output)
+    bridges = payload.get("bridges")
+    if bridges is None:
+        bridges = payload.get("data", {}).get("bridges", [])
+    names = [item["name"] for item in bridges]
+    assert names == ["alpha", "beta", "zeta"]
 
 
 # ---------------------------------------------------------------------------
@@ -1363,838 +1580,3 @@ def test_notebook_list_all_workspaces_combines_results(
     items = payload["data"]["items"]
     assert [item["id"] for item in items] == ["nb-gpu", "nb-cpu"]
     assert calls == [ws_cpu, ws_gpu]
-
-
-def test_notebook_start_accepts_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    ws_cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
-    ws_gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
-
-    config = config_module.Config(
-        username="user",
-        password="pass",
-        base_url="https://example.invalid",
-        target_dir=str(tmp_path / "logs"),
-        job_cache_path=str(tmp_path / "jobs.json"),
-        log_cache_dir=str(tmp_path / "log_cache"),
-        job_workspace_id=None,
-        workspace_cpu_id=ws_cpu,
-        workspace_gpu_id=ws_gpu,
-        workspace_internet_id=None,
-        timeout=5,
-        max_retries=0,
-        retry_delay=0.0,
-    )
-
-    def fake_from_files_and_env(
-        cls, require_target_dir: bool = False, require_credentials: bool = True
-    ):  # type: ignore[override]
-        return config, {}
-
-    monkeypatch.setattr(
-        config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
-    )
-
-    class FakeSession:
-        workspace_id = "ws-00000000-0000-0000-0000-000000000000"
-        storage_state = {}
-
-    monkeypatch.setattr(web_session_module, "get_web_session", lambda: FakeSession())
-
-    item = {
-        "id": "78822a57-3830-44e7-8d45-e8b0d674fc44",
-        "name": "ring-8h100-test",
-        "status": "STOPPED",
-        "created_at": "2026-02-01T10:00:00Z",
-        "quota": {"cpu_count": 8, "gpu_count": 8},
-    }
-
-    def fake_request_json(
-        session,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[dict[str, str]] = None,
-        body: Optional[dict] = None,
-        timeout: int = 30,
-        _retry_count: int = 0,
-    ) -> dict:
-        assert timeout
-        assert _retry_count >= 0
-
-        if method.upper() == "GET" and url.endswith("/api/v1/user/detail"):
-            return {"data": {"id": "user-1"}}
-
-        assert method.upper() == "POST"
-        assert url.endswith("/api/v1/notebook/list")
-        assert body and "workspace_id" in body
-        assert (body.get("filter_by") or {}).get("keyword") == "ring-8h100-test"
-
-        ws_id = str(body["workspace_id"])
-        if ws_id == ws_cpu:
-            return {"code": 0, "data": {"list": [item]}}
-        if ws_id == ws_gpu:
-            return {"code": 0, "data": {"list": []}}
-        return {"code": 0, "data": {"list": []}}
-
-    monkeypatch.setattr(web_session_module, "request_json", fake_request_json)
-
-    started: dict[str, str] = {}
-
-    def fake_start_notebook(notebook_id: str, session=None) -> dict:  # type: ignore[no-untyped-def]
-        started["notebook_id"] = notebook_id
-        return {"ok": True}
-
-    monkeypatch.setattr(browser_api_module, "start_notebook", fake_start_notebook)
-
-    def fake_wait_for_notebook_running(
-        notebook_id: str, session=None, timeout: int = 600, poll_interval: int = 5
-    ) -> dict:
-        return {"status": "RUNNING", "notebook_id": notebook_id, "quota": {"gpu_count": 8}}
-
-    monkeypatch.setattr(
-        browser_api_module, "wait_for_notebook_running", fake_wait_for_notebook_running
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(cli_main, ["notebook", "start", "ring-8h100-test", "--no-keepalive"])
-
-    assert result.exit_code == EXIT_SUCCESS
-    assert started["notebook_id"] == item["id"]
-
-
-def test_notebook_start_name_conflict_prompts_selection(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    ws_cpu = "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65"
-    ws_gpu = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
-
-    config = config_module.Config(
-        username="user",
-        password="pass",
-        base_url="https://example.invalid",
-        target_dir=str(tmp_path / "logs"),
-        job_cache_path=str(tmp_path / "jobs.json"),
-        log_cache_dir=str(tmp_path / "log_cache"),
-        job_workspace_id=None,
-        workspace_cpu_id=ws_cpu,
-        workspace_gpu_id=ws_gpu,
-        workspace_internet_id=None,
-        timeout=5,
-        max_retries=0,
-        retry_delay=0.0,
-    )
-
-    def fake_from_files_and_env(
-        cls, require_target_dir: bool = False, require_credentials: bool = True
-    ):  # type: ignore[override]
-        return config, {}
-
-    monkeypatch.setattr(
-        config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
-    )
-
-    class FakeSession:
-        workspace_id = "ws-00000000-0000-0000-0000-000000000000"
-        storage_state = {}
-
-    monkeypatch.setattr(web_session_module, "get_web_session", lambda: FakeSession())
-
-    cpu_item = {
-        "id": "nb-cpu",
-        "name": "ring-8h100-test",
-        "status": "STOPPED",
-        "created_at": "2026-02-02T10:00:00Z",
-        "quota": {"cpu_count": 8, "gpu_count": 8},
-    }
-    gpu_item = {
-        "id": "nb-gpu",
-        "name": "ring-8h100-test",
-        "status": "STOPPED",
-        "created_at": "2026-02-01T10:00:00Z",
-        "quota": {"cpu_count": 8, "gpu_count": 8},
-    }
-
-    def fake_request_json(
-        session,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[dict[str, str]] = None,
-        body: Optional[dict] = None,
-        timeout: int = 30,
-        _retry_count: int = 0,
-    ) -> dict:
-        assert timeout
-        assert _retry_count >= 0
-
-        if method.upper() == "GET" and url.endswith("/api/v1/user/detail"):
-            return {"data": {"id": "user-1"}}
-
-        assert method.upper() == "POST"
-        assert url.endswith("/api/v1/notebook/list")
-        assert body and "workspace_id" in body
-        assert (body.get("filter_by") or {}).get("keyword") == "ring-8h100-test"
-
-        ws_id = str(body["workspace_id"])
-        if ws_id == ws_cpu:
-            return {"code": 0, "data": {"list": [cpu_item]}}
-        if ws_id == ws_gpu:
-            return {"code": 0, "data": {"list": [gpu_item]}}
-        return {"code": 0, "data": {"list": []}}
-
-    monkeypatch.setattr(web_session_module, "request_json", fake_request_json)
-
-    started: dict[str, str] = {}
-
-    def fake_start_notebook(notebook_id: str, session=None) -> dict:  # type: ignore[no-untyped-def]
-        started["notebook_id"] = notebook_id
-        return {"ok": True}
-
-    monkeypatch.setattr(browser_api_module, "start_notebook", fake_start_notebook)
-
-    def fake_wait_for_notebook_running(
-        notebook_id: str, session=None, timeout: int = 600, poll_interval: int = 5
-    ) -> dict:
-        return {"status": "RUNNING", "notebook_id": notebook_id, "quota": {"gpu_count": 8}}
-
-    monkeypatch.setattr(
-        browser_api_module, "wait_for_notebook_running", fake_wait_for_notebook_running
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_main,
-        ["notebook", "start", "ring-8h100-test", "--no-keepalive"],
-        input="2\n",
-    )
-
-    assert result.exit_code == EXIT_SUCCESS
-    assert started["notebook_id"] == "nb-gpu"
-
-
-def test_run_notebook_ssh_validates_dropbear_setup_script(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """setup_script is now optional — built-in bootstrap handles dropbear.
-
-    This test verifies that *no* ConfigError is raised when dropbear_deb_dir
-    is set without a setup_script.  The code should proceed to the rtunnel
-    setup phase (mocked here to raise so we can verify it was reached).
-    """
-
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    class FakeTunnelConfig:
-        def __init__(self) -> None:
-            self.bridges: dict[str, object] = {}
-            self.default_bridge = None
-
-        def add_bridge(self, profile: object) -> None:
-            name = str(getattr(profile, "name", "default"))
-            self.bridges[name] = profile
-            if self.default_bridge is None:
-                self.default_bridge = name
-
-        def get_bridge(self, name: Optional[str] = None) -> object | None:
-            if name:
-                return self.bridges.get(name)
-            if self.default_bridge:
-                return self.bridges.get(self.default_bridge)
-            return None
-
-    captured: dict[str, str] = {}
-
-    def fake_handle_error(
-        ctx: Context,
-        error_type: str,
-        message: str,
-        exit_code: int,
-        *,
-        hint: Optional[str] = None,
-    ) -> None:
-        assert ctx is not None
-        captured["type"] = error_type
-        captured["message"] = message
-        captured["hint"] = hint or ""
-        raise SystemExit(exit_code)
-
-    monkeypatch.setattr(notebook_cmd_module, "_handle_error", fake_handle_error)
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "H200"}}
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "user-1", "username": "user"},
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_validate_notebook_account_access",
-        lambda current_user, notebook_detail: (True, ""),
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "resolve_ssh_runtime_config",
-        lambda cli_overrides=None: SshRuntimeConfig(
-            dropbear_deb_dir="/project/dropbear",
-            setup_script=None,
-        ),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "setup_notebook_rtunnel",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
-
-    fake_tunnel_config = FakeTunnelConfig()
-    monkeypatch.setattr(
-        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
-    )
-    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: False)
-
-    with pytest.raises(SystemExit) as exc:
-        notebook_cmd_module.run_notebook_ssh(
-            Context(),
-            notebook_id="nb-name",
-            wait=True,
-            pubkey=None,
-            save_as=None,
-            port=31337,
-            ssh_port=22222,
-            command=None,
-            rtunnel_bin=None,
-            debug_playwright=False,
-            setup_timeout=60,
-        )
-
-    # No longer a ConfigError — the code now proceeds to rtunnel setup
-    # which is mocked to raise AssertionError ("should not be called" was
-    # correct when the validation blocked it; now we expect it to be called).
-    assert exc.value.code != EXIT_CONFIG_ERROR
-
-
-def test_run_notebook_ssh_fails_fast_on_account_mismatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    captured: dict[str, str] = {}
-
-    def fake_handle_error(
-        ctx: Context,
-        error_type: str,
-        message: str,
-        exit_code: int,
-        *,
-        hint: Optional[str] = None,
-    ) -> None:
-        assert ctx is not None
-        captured["type"] = error_type
-        captured["message"] = message
-        captured["hint"] = hint or ""
-        raise SystemExit(exit_code)
-
-    monkeypatch.setattr(notebook_cmd_module, "_handle_error", fake_handle_error)
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "user_id": "other-user",
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "H200"}},
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "current-user", "username": "current"},
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "setup_notebook_rtunnel",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        notebook_cmd_module.run_notebook_ssh(
-            Context(),
-            notebook_id="nb-name",
-            wait=True,
-            pubkey=None,
-            save_as=None,
-            port=31337,
-            ssh_port=22222,
-            command=None,
-            rtunnel_bin=None,
-            debug_playwright=False,
-            setup_timeout=60,
-        )
-
-    assert exc.value.code == EXIT_CONFIG_ERROR
-    assert captured["type"] == "ConfigError"
-    assert "Notebook/account mismatch" in captured["message"]
-
-
-def test_run_notebook_ssh_passes_resolved_runtime_to_setup(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    class FakeTunnelConfig:
-        def __init__(self) -> None:
-            self.bridges: dict[str, object] = {}
-            self.default_bridge = None
-
-        def add_bridge(self, profile: object) -> None:
-            name = str(getattr(profile, "name", "default"))
-            self.bridges[name] = profile
-            if self.default_bridge is None:
-                self.default_bridge = name
-
-        def get_bridge(self, name: Optional[str] = None) -> object | None:
-            if name:
-                return self.bridges.get(name)
-            if self.default_bridge:
-                return self.bridges.get(self.default_bridge)
-            return None
-
-    resolved_runtime = SshRuntimeConfig(
-        rtunnel_bin="/project/rtunnel",
-        rtunnel_download_url="https://project.example/rtunnel.tgz",
-    )
-    setup_kwargs: dict[str, object] = {}
-    fake_tunnel_config = FakeTunnelConfig()
-
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "user-1", "username": "user"},
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_validate_notebook_account_access",
-        lambda current_user, notebook_detail: (True, ""),
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "resolve_ssh_runtime_config",
-        lambda cli_overrides=None: resolved_runtime,
-    )
-
-    def fake_setup_notebook_rtunnel(**kwargs):  # type: ignore[no-untyped-def]
-        setup_kwargs.update(kwargs)
-        return "wss://proxy.example/notebook/"
-
-    monkeypatch.setattr(browser_api_module, "setup_notebook_rtunnel", fake_setup_notebook_rtunnel)
-
-    monkeypatch.setattr(
-        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
-    )
-    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
-    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
-    monkeypatch.setattr(
-        tunnel_module,
-        "get_ssh_command_args",
-        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
-    )
-    monkeypatch.setattr(
-        tunnel_module,
-        "is_tunnel_available",
-        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
-    )
-
-    monkeypatch.setattr(notebook_cmd_module.subprocess, "call", lambda args: 0)
-
-    notebook_cmd_module.run_notebook_ssh(
-        Context(),
-        notebook_id="nb-name",
-        wait=True,
-        pubkey=None,
-        save_as=None,
-        port=31337,
-        ssh_port=22222,
-        command=None,
-        rtunnel_bin="/cli/rtunnel",
-        debug_playwright=False,
-        setup_timeout=60,
-    )
-
-    assert setup_kwargs["ssh_runtime"] is resolved_runtime
-
-
-def test_run_notebook_ssh_refreshes_saved_profile_on_notebook_mismatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    class FakeTunnelConfig:
-        def __init__(self) -> None:
-            self.bridges: dict[str, object] = {}
-            self.default_bridge = None
-
-        def add_bridge(self, profile: object) -> None:
-            name = str(getattr(profile, "name", "default"))
-            self.bridges[name] = profile
-            if self.default_bridge is None:
-                self.default_bridge = name
-
-        def get_bridge(self, name: Optional[str] = None) -> object | None:
-            if name:
-                return self.bridges.get(name)
-            if self.default_bridge:
-                return self.bridges.get(self.default_bridge)
-            return None
-
-    setup_called = {"value": False}
-    fake_tunnel_config = FakeTunnelConfig()
-    fake_tunnel_config.add_bridge(
-        tunnel_module.BridgeProfile(
-            name="shared-profile",
-            proxy_url="wss://proxy.example/old",
-            notebook_id="notebook-old",
-        )
-    )
-
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "user-1", "username": "user"},
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_validate_notebook_account_access",
-        lambda current_user, notebook_detail: (True, ""),
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "resolve_ssh_runtime_config",
-        lambda cli_overrides=None: SshRuntimeConfig(),
-    )
-
-    def fake_setup_notebook_rtunnel(**kwargs):  # type: ignore[no-untyped-def]
-        setup_called["value"] = True
-        return "wss://proxy.example/new"
-
-    monkeypatch.setattr(browser_api_module, "setup_notebook_rtunnel", fake_setup_notebook_rtunnel)
-    monkeypatch.setattr(
-        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
-    )
-    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
-    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
-    monkeypatch.setattr(
-        tunnel_module,
-        "is_tunnel_available",
-        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
-    )
-    monkeypatch.setattr(
-        tunnel_module,
-        "get_ssh_command_args",
-        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
-    )
-
-    monkeypatch.setattr(notebook_cmd_module.subprocess, "call", lambda args: 0)
-
-    notebook_cmd_module.run_notebook_ssh(
-        Context(),
-        notebook_id="nb-name",
-        wait=True,
-        pubkey=None,
-        save_as="shared-profile",
-        port=31337,
-        ssh_port=22222,
-        command=None,
-        rtunnel_bin="/cli/rtunnel",
-        debug_playwright=False,
-        setup_timeout=60,
-    )
-
-    assert setup_called["value"] is True
-    saved_profile = fake_tunnel_config.bridges["shared-profile"]
-    assert getattr(saved_profile, "notebook_id", None) == "notebook-12345678"
-
-
-def test_run_notebook_ssh_interactive_reconnects_after_drop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    class FakeTunnelConfig:
-        def __init__(self) -> None:
-            self.bridges: dict[str, object] = {}
-            self.default_bridge = None
-
-        def add_bridge(self, profile: object) -> None:
-            name = str(getattr(profile, "name", "default"))
-            self.bridges[name] = profile
-            if self.default_bridge is None:
-                self.default_bridge = name
-
-        def get_bridge(self, name: Optional[str] = None) -> object | None:
-            if name:
-                return self.bridges.get(name)
-            if self.default_bridge:
-                return self.bridges.get(self.default_bridge)
-            return None
-
-    cfg = make_test_config(tmp_path)
-    cfg.tunnel_retries = 2
-    cfg.tunnel_retry_pause = 0.0
-
-    reconnect_calls = {"rebuild": 0}
-    fake_tunnel_config = FakeTunnelConfig()
-
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: cfg)
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "user-1", "username": "user"},
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_validate_notebook_account_access",
-        lambda current_user, notebook_detail: (True, ""),
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "resolve_ssh_runtime_config",
-        lambda cli_overrides=None: SshRuntimeConfig(),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "setup_notebook_rtunnel",
-        lambda **kwargs: "wss://proxy.example/notebook/",
-    )
-    monkeypatch.setattr(
-        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
-    )
-    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
-    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
-    monkeypatch.setattr(
-        tunnel_module,
-        "is_tunnel_available",
-        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: True,
-    )
-    monkeypatch.setattr(
-        tunnel_module,
-        "get_ssh_command_args",
-        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
-    )
-
-    ssh_rc = iter([255, 0])
-    monkeypatch.setattr(notebook_cmd_module.subprocess, "call", lambda args: next(ssh_rc))
-
-    def fake_rebuild(*args: Any, **kwargs: Any) -> object:
-        reconnect_calls["rebuild"] += 1
-        profile_name = str(kwargs.get("bridge_name", "notebook-12345678"))
-        return fake_tunnel_config.bridges[profile_name]
-
-    monkeypatch.setattr(notebook_cmd_module, "rebuild_notebook_bridge_profile", fake_rebuild)
-
-    notebook_cmd_module.run_notebook_ssh(
-        Context(),
-        notebook_id="nb-name",
-        wait=True,
-        pubkey=None,
-        save_as=None,
-        port=31337,
-        ssh_port=22222,
-        command=None,
-        rtunnel_bin="/cli/rtunnel",
-        debug_playwright=False,
-        setup_timeout=60,
-    )
-
-    assert reconnect_calls["rebuild"] == 1
-
-
-def test_run_notebook_ssh_reports_when_tunnel_not_ready(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class FakeSession:
-        workspace_id = "ws-test"
-        storage_state = {}
-
-    class FakeTunnelConfig:
-        def __init__(self) -> None:
-            self.bridges: dict[str, object] = {}
-            self.default_bridge = None
-
-        def add_bridge(self, profile: object) -> None:
-            self.bridges[str(getattr(profile, "name", "default"))] = profile
-
-    captured: dict[str, str] = {}
-
-    def fake_handle_error(
-        ctx: Context,
-        error_type: str,
-        message: str,
-        exit_code: int,
-        *,
-        hint: Optional[str] = None,
-    ) -> None:
-        assert ctx is not None
-        captured["type"] = error_type
-        captured["message"] = message
-        captured["hint"] = hint or ""
-        raise SystemExit(exit_code)
-
-    monkeypatch.setattr(notebook_cmd_module, "_handle_error", fake_handle_error)
-    monkeypatch.setattr(notebook_cmd_module, "require_web_session", lambda ctx, hint: FakeSession())
-    monkeypatch.setattr(notebook_cmd_module, "load_config", lambda ctx: make_test_config(tmp_path))
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_resolve_notebook_id",
-        lambda *args, **kwargs: ("notebook-12345678", None),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "wait_for_notebook_running",
-        lambda notebook_id, session=None: {
-            "resource_spec_price": {"gpu_info": {"gpu_product_simple": "CPU"}}
-        },
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_get_current_user_detail",
-        lambda session, base_url: {"id": "user-1", "username": "user"},
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "_validate_notebook_account_access",
-        lambda current_user, notebook_detail: (True, ""),
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module, "load_ssh_public_key", lambda pubkey: "ssh-ed25519 AAA"
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module,
-        "resolve_ssh_runtime_config",
-        lambda cli_overrides=None: SshRuntimeConfig(),
-    )
-    monkeypatch.setattr(
-        browser_api_module,
-        "setup_notebook_rtunnel",
-        lambda **kwargs: "wss://proxy.example/notebook/",
-    )
-
-    fake_tunnel_config = FakeTunnelConfig()
-    monkeypatch.setattr(
-        tunnel_module, "load_tunnel_config", lambda account=None: fake_tunnel_config
-    )
-    monkeypatch.setattr(tunnel_module, "save_tunnel_config", lambda config: None)
-    monkeypatch.setattr(tunnel_module, "has_internet_for_gpu_type", lambda gpu_type: True)
-    monkeypatch.setattr(
-        tunnel_module,
-        "is_tunnel_available",
-        lambda bridge_name, config, retries=0, retry_pause=0.0, progressive=True: False,
-    )
-    monkeypatch.setattr(
-        tunnel_module,
-        "get_ssh_command_args",
-        lambda bridge_name, config, remote_command=None: ["ssh", "root@localhost"],
-    )
-    monkeypatch.setattr(
-        notebook_cmd_module.os,
-        "execvp",
-        lambda file, args: (_ for _ in ()).throw(AssertionError("execvp should not run")),
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        notebook_cmd_module.run_notebook_ssh(
-            Context(),
-            notebook_id="nb-name",
-            wait=True,
-            pubkey=None,
-            save_as=None,
-            port=31337,
-            ssh_port=22222,
-            command=None,
-            rtunnel_bin="/cli/rtunnel",
-            debug_playwright=False,
-            setup_timeout=60,
-        )
-
-    assert exc.value.code == EXIT_API_ERROR
-    assert captured["type"] == "APIError"
-    assert "SSH preflight failed" in captured["message"]
-    assert "Proxy readiness report:" in captured["hint"]
