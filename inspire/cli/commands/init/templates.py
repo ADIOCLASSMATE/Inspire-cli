@@ -81,6 +81,7 @@ denylist = ["*.tmp", ".git/*"]
 [notebook]
 resource = "1xH200"
 # image = "pytorch:latest"
+# post_start = "bash /workspace/bootstrap.sh"  # none | shell command
 
 [remote_env]
 # Environment variables exported before remote commands run.
@@ -92,9 +93,10 @@ resource = "1xH200"
 
 def _init_template_mode(global_flag: bool, project_flag: bool, force: bool) -> None:
     """Initialize config using template with placeholders (template mode)."""
+    global_path = Config.resolve_global_config_path()
     if global_flag:
-        config_dir = Config.GLOBAL_CONFIG_PATH.parent
-        config_path = Config.GLOBAL_CONFIG_PATH
+        config_dir = global_path.parent
+        config_path = global_path
         location_comment = "~/.config/inspire/config.toml (global)"
     elif project_flag:
         config_path = Path.cwd() / PROJECT_CONFIG_DIR / CONFIG_FILENAME
@@ -109,8 +111,8 @@ def _init_template_mode(global_flag: bool, project_flag: bool, force: bool) -> N
         )
 
         if choice.lower() == "g":
-            config_dir = Config.GLOBAL_CONFIG_PATH.parent
-            config_path = Config.GLOBAL_CONFIG_PATH
+            config_dir = global_path.parent
+            config_path = global_path
             location_comment = "~/.config/inspire/config.toml (global)"
         else:
             config_path = Path.cwd() / PROJECT_CONFIG_DIR / CONFIG_FILENAME
@@ -246,7 +248,7 @@ def _init_smart_mode(
         click.echo(f"  - {len(project_opts)} project-scope option(s)")
     click.echo()
 
-    global_path = Config.GLOBAL_CONFIG_PATH
+    global_path = Config.resolve_global_config_path()
     project_path = Path.cwd() / PROJECT_CONFIG_DIR / CONFIG_FILENAME
 
     if global_flag:

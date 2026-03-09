@@ -37,6 +37,10 @@ from inspire.platform.web.browser_api.core import (
 from inspire.bridge.tunnel import load_tunnel_config
 from inspire.platform.web.session import WebSession, build_requests_session, get_web_session
 
+import logging
+
+_log = logging.getLogger("inspire.platform.web.browser_api.rtunnel")
+
 
 # ============================================================================
 # Commands
@@ -106,6 +110,24 @@ def build_rtunnel_setup_commands(
     if apt_mirror_url:
         cmd_lines.append(f"APT_MIRROR_URL={shlex.quote(apt_mirror_url)}")
 
+    # Skip curl fallback when rtunnel was delivered via Contents API or when
+    # the notebook is known to have no internet (dropbear/apt-mirror config).
+    skip_curl = bool(contents_api_filename or dropbear_deb_dir or apt_mirror_url)
+
+    if skip_curl:
+        curl_rtunnel_block = (
+            'if [ ! -x "$RTUNNEL_BIN" ]; then '
+            'echo "ERROR: rtunnel binary not found at /tmp/rtunnel '
+            '(no curl fallback for offline notebooks)" >&2; fi'
+        )
+    else:
+        curl_rtunnel_block = (
+            'if [ ! -x "$RTUNNEL_BIN" ]; then curl -fsSL '
+            f"'{rtunnel_download_url}' -o /tmp/rtunnel.tgz && "
+            "tar -xzf /tmp/rtunnel.tgz -C /tmp && chmod +x /tmp/rtunnel "
+            "2>/dev/null; fi"
+        )
+
     openssh_bootstrap_cmd = (
         'if [ ! -f "$BOOTSTRAP_SENTINEL" ] || [ ! -x /tmp/rtunnel ] '
         "|| [ ! -x /usr/sbin/sshd ]; then "
@@ -118,10 +140,7 @@ def build_rtunnel_setup_commands(
         "RTUNNEL_BIN=/tmp/rtunnel; "
         'if [ -n "${RTUNNEL_BIN_PATH:-}" ] && [ -x "$RTUNNEL_BIN_PATH" ]; then '
         'cp "$RTUNNEL_BIN_PATH" /tmp/rtunnel && chmod +x /tmp/rtunnel; fi; '
-        'if [ ! -x "$RTUNNEL_BIN" ]; then curl -fsSL '
-        f"'{rtunnel_download_url}' -o /tmp/rtunnel.tgz && "
-        "tar -xzf /tmp/rtunnel.tgz -C /tmp && chmod +x /tmp/rtunnel "
-        "2>/dev/null; fi; "
+        f"{curl_rtunnel_block}; "
         'if [ -x /usr/sbin/sshd ] && [ -x "$RTUNNEL_BIN" ]; then '
         'touch "$BOOTSTRAP_SENTINEL"; else rm -f "$BOOTSTRAP_SENTINEL"; fi; fi'
     )
@@ -130,10 +149,7 @@ def build_rtunnel_setup_commands(
         'if [ ! -x "$RTUNNEL_BIN" ] && [ -n "${RTUNNEL_BIN_PATH:-}" ] '
         '&& [ -x "$RTUNNEL_BIN_PATH" ]; then '
         'cp "$RTUNNEL_BIN_PATH" /tmp/rtunnel && chmod +x /tmp/rtunnel; fi; '
-        'if [ ! -x "$RTUNNEL_BIN" ]; then curl -fsSL '
-        f"'{rtunnel_download_url}' -o /tmp/rtunnel.tgz && "
-        "tar -xzf /tmp/rtunnel.tgz -C /tmp && chmod +x /tmp/rtunnel "
-        "2>/dev/null; fi"
+        f"{curl_rtunnel_block}"
     )
     start_sshd_cmd = (
         'if [ -x /usr/sbin/sshd ] && ! ps -ef | grep -q "[s]shd -p $SSH_PORT"; then '
@@ -858,7 +874,7 @@ def _delete_terminal_via_api(
         return False
 
 
-_CONTENTS_API_RTUNNEL_FILENAME = ".inspire_rtunnel_bin"
+_CONTENTS_API_RTUNNEL_FILENAME = "inspire_rtunnel_bin"
 
 
 def _upload_rtunnel_via_contents_api(
@@ -875,16 +891,19 @@ def _upload_rtunnel_via_contents_api(
     import base64 as _b64
 
     if not local_binary_path.is_file():
+        _log.debug("Upload skipped: local binary not found at %s", local_binary_path)
         return False
 
     try:
         raw = local_binary_path.read_bytes()
-    except OSError:
+    except OSError as exc:
+        _log.debug("Failed to read local binary %s: %s", local_binary_path, exc)
         return False
 
     encoded = _b64.b64encode(raw).decode("ascii")
     base = _jupyter_server_base(lab_url)
     api_url = f"{base}api/contents/{_CONTENTS_API_RTUNNEL_FILENAME}"
+    _log.debug("Uploading rtunnel via Contents API: %s (%d bytes)", api_url, len(raw))
 
     try:
         headers = _build_jupyter_xsrf_headers(context)
@@ -898,6 +917,13 @@ def _upload_rtunnel_via_contents_api(
             },
             timeout=30000,
         )
+        _log.debug("Contents API upload response: %d", resp.status)
+        if resp.status not in (200, 201):
+            try:
+                body = resp.text()[:500]
+            except Exception:
+                body = "(unable to read body)"
+            _log.debug("Contents API upload error body: %s", body)
         return resp.status in (200, 201)
     except (
         PlaywrightError,
@@ -907,7 +933,8 @@ def _upload_rtunnel_via_contents_api(
         TimeoutError,
         ValueError,
         TypeError,
-    ):
+    ) as exc:
+        _log.debug("Contents API upload failed: %s", exc, exc_info=True)
         return False
 
 
@@ -926,22 +953,26 @@ def _download_rtunnel_locally(
 
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        _log.debug("Downloading rtunnel from %s to %s", download_url, dest)
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
             urllib.request.urlretrieve(download_url, str(tmp_path))
+            _log.debug("Downloaded archive: %s (%d bytes)", tmp_path, tmp_path.stat().st_size)
             with tarfile.open(str(tmp_path), "r:gz") as tar:
                 for member in tar.getmembers():
                     if member.isfile() and "rtunnel" in member.name:
                         extracted = tar.extractfile(member)
                         if extracted:
-                            dest.write_bytes(extracted.read())
+                            data = extracted.read()
+                            dest.write_bytes(data)
                             dest.chmod(0o755)
+                            _log.debug("Extracted rtunnel binary: %s (%d bytes)", dest, len(data))
                             return True
         finally:
             tmp_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("rtunnel local download failed: %s", exc, exc_info=True)
     return False
 
 
@@ -1972,9 +2003,14 @@ def _setup_notebook_rtunnel_sync(
 
             contents_api_filename = None
             local_rtunnel = Path.home() / ".local" / "bin" / "rtunnel"
+            _log.debug("Local rtunnel path: %s (exists=%s)", local_rtunnel, local_rtunnel.is_file())
 
             if not local_rtunnel.is_file():
                 rtunnel_bin_configured = ssh_runtime and ssh_runtime.rtunnel_bin
+                _log.debug(
+                    "rtunnel_bin configured: %s",
+                    ssh_runtime.rtunnel_bin if ssh_runtime else None,
+                )
                 if not rtunnel_bin_configured:
                     download_url = (
                         ssh_runtime.rtunnel_download_url
@@ -1983,12 +2019,22 @@ def _setup_notebook_rtunnel_sync(
                     )
                     if _download_rtunnel_locally(download_url, local_rtunnel):
                         _sys.stderr.write("  Downloaded rtunnel binary locally.\n")
+                    else:
+                        _sys.stderr.write("  WARNING: Failed to download rtunnel binary locally.\n")
 
             if local_rtunnel.is_file():
+                _log.debug("Local rtunnel binary: %d bytes", local_rtunnel.stat().st_size)
                 if _upload_rtunnel_via_contents_api(context, lab_frame.url, local_rtunnel):
                     contents_api_filename = _CONTENTS_API_RTUNNEL_FILENAME
                     _sys.stderr.write("  Uploaded rtunnel binary via Jupyter Contents API.\n")
+                else:
+                    _sys.stderr.write(
+                        "  WARNING: Failed to upload rtunnel binary via Jupyter Contents API.\n"
+                    )
+            else:
+                _sys.stderr.write(f"  WARNING: rtunnel binary not found at {local_rtunnel}\n")
 
+            _log.debug("contents_api_filename=%s", contents_api_filename)
             cmd_lines = build_rtunnel_setup_commands(
                 port=port,
                 ssh_port=ssh_port,
@@ -1997,6 +2043,7 @@ def _setup_notebook_rtunnel_sync(
                 contents_api_filename=contents_api_filename,
             )
             batch_cmd = _build_batch_setup_script(cmd_lines)
+            _log.debug("Setup script length: %d chars, %d commands", len(batch_cmd), len(cmd_lines))
             setup_sent_via_ws = _send_rtunnel_setup_script(
                 context=context,
                 page=page,
@@ -2004,6 +2051,7 @@ def _setup_notebook_rtunnel_sync(
                 batch_cmd=batch_cmd,
                 timer=timer,
             )
+            _log.debug("Setup script sent via WS: %s", setup_sent_via_ws)
             _wait_for_setup_completion(
                 page=page,
                 setup_sent_via_ws=setup_sent_via_ws,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -13,12 +14,16 @@ from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_CONFIG_ERROR
 from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.cli.utils.notebook_cli import load_config, require_web_session, resolve_json_output
+from inspire.cli.utils.notebook_post_start import (
+    NotebookPostStartSpec,
+    NO_WAIT_POST_START_WARNING,
+    resolve_notebook_post_start_spec,
+)
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web.browser_api import NotebookFailedError
 from inspire.platform.web.session import WebSession
-
 
 _CPU_ALIASES = {"CPU", "CPUONLY", "CPU_ONLY", "CPU-ONLY"}
 
@@ -775,12 +780,15 @@ def maybe_wait_for_running(
     notebook_id: str,
     session: WebSession,
     wait: bool,
-    keepalive: bool,
+    needs_post_start: bool,
     json_output: bool,
     timeout: int = 600,
 ) -> bool:
-    if not (wait or keepalive):
+    if not (wait or needs_post_start):
         return True
+
+    if needs_post_start and not wait and not json_output:
+        click.echo(NO_WAIT_POST_START_WARNING, err=True)
 
     if not json_output:
         click.echo("Waiting for notebook to reach RUNNING status...")
@@ -819,35 +827,43 @@ def maybe_wait_for_running(
         return False
 
 
-def maybe_start_keepalive(
+def maybe_run_post_start(
     ctx: Context,
     *,
     notebook_id: str,
     session: WebSession,
-    keepalive: bool,
+    post_start_spec: NotebookPostStartSpec | None,
     gpu_count: int,
     json_output: bool,
 ) -> None:
-    if not (keepalive and gpu_count > 0):
+    if post_start_spec is None:
+        return
+    if post_start_spec.requires_gpu and gpu_count <= 0:
         return
 
-    from inspire.cli.utils.keepalive import get_keepalive_command
-
     if not json_output:
-        click.echo("Starting GPU keepalive script...")
+        click.echo(f"Starting {post_start_spec.label}...")
 
     try:
-        browser_api_module.run_command_in_notebook(
+        started = browser_api_module.run_command_in_notebook(
             notebook_id=notebook_id,
-            command=get_keepalive_command(),
+            command=post_start_spec.command,
             session=session,
+            timeout=20,
+            completion_marker=post_start_spec.completion_marker,
         )
-        if not json_output:
-            click.echo("GPU keepalive script started (log: /tmp/keepalive.log)")
-            click.echo('  To stop: inspire bridge exec "kill $(cat /tmp/keepalive.pid)"')
+        if not json_output and started:
+            click.echo(f"{post_start_spec.label} started (log: {post_start_spec.log_path})")
+            click.echo(f'  To stop: inspire bridge exec "kill $(cat {post_start_spec.pid_file})"')
+        if not json_output and not started:
+            click.echo(
+                f"Warning: Failed to confirm {post_start_spec.label.lower()} startup; check "
+                f"{post_start_spec.log_path} inside the notebook.",
+                err=True,
+            )
     except Exception as e:
         if not json_output:
-            click.echo(f"Warning: Failed to start keepalive script: {e}", err=True)
+            click.echo(f"Warning: Failed to start {post_start_spec.label.lower()}: {e}", err=True)
 
 
 def _resolve_create_inputs(
@@ -1011,10 +1027,12 @@ def run_notebook_create(
     auto_stop: bool,
     auto: bool,
     wait: bool,
-    keepalive: bool,
+    post_start: str | None,
+    post_start_script: Path | None,
     json_output: bool,
     priority: Optional[int] = None,
     project_explicit: bool = False,
+    keepalive: bool | None = None,
 ) -> None:
     del project_explicit  # Reserved for future behavior; currently inferred from value presence.
     json_output = resolve_json_output(ctx, json_output)
@@ -1027,6 +1045,17 @@ def run_notebook_create(
         ),
     )
     config = load_config(ctx)
+
+    try:
+        post_start_spec = resolve_notebook_post_start_spec(
+            config=config,
+            post_start=post_start,
+            post_start_script=post_start_script,
+            keepalive=keepalive,
+        )
+    except ValueError as e:
+        _handle_error(ctx, "ValidationError", str(e), EXIT_CONFIG_ERROR)
+        return
 
     try:
         resource, project, image, shm_size = _resolve_create_inputs(
@@ -1187,17 +1216,17 @@ def run_notebook_create(
         notebook_id=notebook_id,
         session=session,
         wait=wait,
-        keepalive=keepalive,
+        needs_post_start=(post_start_spec is not None),
         json_output=json_output,
         timeout=600,
     ):
         return
 
-    maybe_start_keepalive(
+    maybe_run_post_start(
         ctx,
         notebook_id=notebook_id,
         session=session,
-        keepalive=keepalive,
+        post_start_spec=post_start_spec,
         gpu_count=gpu_count,
         json_output=json_output,
     )

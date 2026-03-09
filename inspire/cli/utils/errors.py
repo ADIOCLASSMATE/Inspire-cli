@@ -13,6 +13,15 @@ from inspire.cli.context import EXIT_GENERAL_ERROR, Context
 from inspire.cli.formatters import human_formatter, json_formatter
 
 
+def _emit_debug_report_hint(ctx: Context) -> None:
+    if not getattr(ctx, "debug", False):
+        return
+    debug_report_path = getattr(ctx, "debug_report_path", None)
+    if not debug_report_path:
+        return
+    click.echo(f"Debug report: {debug_report_path}", err=True)
+
+
 def emit_error(
     ctx: Context,
     error_type: str,
@@ -29,6 +38,7 @@ def emit_error(
         )
     else:
         click.echo(human_formatter.format_error(message, hint=hint), err=True)
+        _emit_debug_report_hint(ctx)
     return exit_code
 
 

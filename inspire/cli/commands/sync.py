@@ -1,10 +1,10 @@
 """Sync command - Push local branch and sync code on Bridge.
 
 Usage:
-    inspire sync [--branch <branch>] [--remote <remote>] [--transport <ssh|workflow>]
+    inspire sync [--remote <remote>] [--transport <ssh|workflow>]
 
 This command:
-1. Pushes the current (or specified) branch to the remote
+1. Pushes the current branch to the remote
 2. Syncs code on Bridge via selected transport
 3. Returns the synced commit SHA
 
@@ -52,6 +52,8 @@ from inspire.cli.utils.output import (
     emit_error as emit_output_error,
     emit_success as emit_output_success,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_current_branch() -> str:
@@ -125,7 +127,7 @@ def push_to_remote(branch: str, remote: str, *, show_progress: bool = False) -> 
             text=True,
         )
         if result.stderr:
-            logging.debug(result.stderr)
+            logger.debug("git push stderr: %s", result.stderr)
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr or e.stdout or str(e)
         raise click.ClickException(f"Failed to push to {remote}: {error_msg}")
@@ -490,12 +492,6 @@ def sync_via_workflow(
 
 @click.command()
 @click.option(
-    "--branch",
-    "-b",
-    default=None,
-    help="Branch to sync (default: current branch)",
-)
-@click.option(
     "--remote",
     "-r",
     default=None,
@@ -552,7 +548,6 @@ def sync_via_workflow(
 @pass_context
 def sync(
     ctx: Context,
-    branch: Optional[str],
     remote: Optional[str],
     no_push: bool,
     allow_dirty: bool,
@@ -575,7 +570,6 @@ def sync(
         inspire sync                          # Sync current branch via SSH tunnel
         inspire sync --transport workflow     # Sync via workflow transport
         inspire sync --remote upstream        # Sync via upstream remote
-        inspire sync --branch feature/new     # Sync specific branch
         inspire sync --source bundle          # Force local bundle sync over SSH
         inspire sync --push-mode best-effort  # Continue even if git push fails
         inspire sync --no-push                # Skip git push (equivalent to --push-mode skip)
@@ -600,9 +594,8 @@ def sync(
         )
         sys.exit(EXIT_CONFIG_ERROR)
 
-    # Determine branch
-    if branch is None:
-        branch = get_current_branch()
+    # Determine current branch
+    branch = get_current_branch()
 
     # Determine remote
     if remote is None:
