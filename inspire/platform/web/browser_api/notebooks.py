@@ -115,6 +115,15 @@ def list_images(
         workspace_id=workspace_id, session=session
     )
 
+    # Normalise short aliases so callers can use e.g. "personal-visible".
+    _source_alias = {
+        "personal-visible": "SOURCE_PERSONAL_VISIBLE",
+        "private": "SOURCE_PRIVATE",
+        "public": "SOURCE_PUBLIC",
+        "official": "SOURCE_OFFICIAL",
+    }
+    source = _source_alias.get(source.lower(), source)
+
     if source == "SOURCE_PUBLIC":
         # Public images require source_list + visibility (not a simple source field).
         # Discovered via Playwright network capture of the platform UI.
@@ -124,6 +133,16 @@ def list_images(
             "filter": {
                 "source_list": ["SOURCE_PRIVATE", "SOURCE_PUBLIC"],
                 "visibility": "VISIBILITY_PUBLIC",
+                "registry_hint": {"workspace_id": workspace_id},
+            },
+        }
+    elif source == "SOURCE_PERSONAL_VISIBLE":
+        body = {
+            "page": 0,
+            "page_size": -1,
+            "filter": {
+                "source_list": ["SOURCE_PRIVATE", "SOURCE_PUBLIC"],
+                "visibility": "VISIBILITY_PRIVATE",
                 "registry_hint": {"workspace_id": workspace_id},
             },
         }

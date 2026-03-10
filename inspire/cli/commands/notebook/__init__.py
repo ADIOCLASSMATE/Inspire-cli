@@ -19,6 +19,7 @@ from .notebook_commands import (
     ssh_notebook_cmd,
     start_notebook_cmd,
     stop_notebook_cmd,
+    terminal_notebook_cmd,
 )
 from .top import notebook_top
 
@@ -41,4 +42,5 @@ notebook.add_command(create_notebook_cmd)
 notebook.add_command(stop_notebook_cmd)
 notebook.add_command(start_notebook_cmd)
 notebook.add_command(ssh_notebook_cmd)
+notebook.add_command(terminal_notebook_cmd)
 notebook.add_command(notebook_top)
