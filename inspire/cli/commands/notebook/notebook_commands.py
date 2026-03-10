@@ -18,6 +18,7 @@ from .notebook_lookup import (
 )
 from .notebook_presenters import _print_notebook_detail, _print_notebook_list
 from .notebook_ssh_flow import run_notebook_ssh
+from .notebook_terminal_flow import run_notebook_terminal
 from inspire.cli.context import (
     Context,
     EXIT_API_ERROR,
@@ -758,6 +759,42 @@ def ssh_notebook_cmd(
     )
 
 
+@click.command("terminal")
+@click.argument("notebook")
+@click.option(
+    "--tmux",
+    "-t",
+    "tmux_session",
+    default=None,
+    help="Auto-create or attach to a tmux session with this name",
+)
+@pass_context
+def terminal_notebook_cmd(
+    ctx: Context,
+    notebook: str,
+    tmux_session: Optional[str],
+) -> None:
+    """Open an interactive terminal to a running notebook.
+
+    Connects directly via Jupyter terminal WebSocket — no SSH or rtunnel
+    required. Works on all notebook types (CPU, 4090, H100, H200).
+
+    \b
+    Examples:
+        inspire notebook terminal dev-4090
+        inspire notebook terminal dev-h100 --tmux train
+        inspire notebook terminal abc123-def456
+
+    \b
+    Disconnect with Ctrl+] (like telnet).
+    """
+    run_notebook_terminal(
+        ctx,
+        notebook_id=notebook,
+        tmux_session=tmux_session,
+    )
+
+
 __all__ = [
     "create_notebook_cmd",
     "list_notebooks",
@@ -765,4 +802,5 @@ __all__ = [
     "ssh_notebook_cmd",
     "start_notebook_cmd",
     "stop_notebook_cmd",
+    "terminal_notebook_cmd",
 ]
