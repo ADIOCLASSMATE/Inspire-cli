@@ -902,14 +902,18 @@ class TestInitCommand:
                 project_id="project-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
                 name="Over Quota",
                 workspace_id=workspace_id,
+                budget=100.0,
                 member_gpu_limit=True,
+                member_remain_budget=1.0,
                 member_remain_gpu_hours=-1,
             ),
             ProjectInfo(
                 project_id="project-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
                 name="Good Project",
                 workspace_id=workspace_id,
+                budget=100.0,
                 member_gpu_limit=True,
+                member_remain_budget=10.0,
                 member_remain_gpu_hours=10,
             ),
         ]

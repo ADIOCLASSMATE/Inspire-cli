@@ -88,16 +88,23 @@ def _print_notebook_list(items: list, json_output: bool) -> None:
         return
 
     lines = [
-        f"{'Name':<25} {'Status':<12} {'Resource':<12} {'ID':<38}",
-        "-" * 90,
+        f"{'Name':<25} {'Status':<12} {'Project':<20} {'Resource':<12} {'ID':<38}",
+        "-" * 112,
     ]
 
     for item in items:
         name = item.get("name", "N/A")[:25]
         status = item.get("status", "Unknown")[:12]
+        project = (
+            ((item.get("project") or {}).get("name"))
+            or item.get("project_name")
+            or "N/A"
+        )[:20]
         notebook_id = item.get("notebook_id", item.get("id", "N/A"))
         resource_info = _format_notebook_resource(item)
-        lines.append(f"{name:<25} {status:<12} {resource_info:<12} {notebook_id:<38}")
+        lines.append(
+            f"{name:<25} {status:<12} {project:<20} {resource_info:<12} {notebook_id:<38}"
+        )
 
     lines.append(f"\nShowing {len(items)} notebook(s)")
     click.echo("\n".join(lines))

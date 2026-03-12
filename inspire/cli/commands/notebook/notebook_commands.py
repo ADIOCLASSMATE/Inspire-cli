@@ -8,6 +8,7 @@ from typing import Optional
 import click
 
 from .notebook_create_flow import maybe_run_post_start, run_notebook_create
+from .notebook_exec_flow import run_notebook_exec
 from .notebook_lookup import (
     _ZERO_WORKSPACE_ID,
     _list_notebooks_for_workspace,
@@ -602,11 +603,16 @@ def list_notebooks(
                 return
 
     if not workspace_ids:
+        # Default to GPU workspace for notebook list (notebooks are typically GPU workloads)
         try:
-            resolved = select_workspace_id(config)
-        except ConfigError as e:
-            _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-            return
+            resolved = select_workspace_id(config, gpu_type="H200")
+        except ConfigError:
+            # Fall back to any available workspace
+            try:
+                resolved = select_workspace_id(config)
+            except ConfigError as e:
+                _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
+                return
 
         resolved = resolved or getattr(session, "workspace_id", None)
         resolved = None if resolved == _ZERO_WORKSPACE_ID else resolved
@@ -795,8 +801,67 @@ def terminal_notebook_cmd(
     )
 
 
+@click.command("exec")
+@click.argument("notebook")
+@click.argument("command")
+@click.option(
+    "--timeout",
+    "-T",
+    default=120,
+    show_default=True,
+    help="Timeout in seconds for command completion",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Alias for global --json",
+)
+@click.option(
+    "--session",
+    "-s",
+    "use_session",
+    is_flag=True,
+    help="Use persistent session (keeps browser open for fast repeated commands)",
+)
+@pass_context
+def exec_notebook_cmd(
+    ctx: Context,
+    notebook: str,
+    command: str,
+    timeout: int,
+    json_output: bool,
+    use_session: bool,
+) -> None:
+    """Execute a command on a notebook and capture output.
+
+    Connects via Jupyter terminal WebSocket — no SSH or rtunnel required.
+    Output is streamed in real time. Exit code is propagated.
+
+    Use --session to keep the connection alive between calls. The first
+    call starts a background daemon; subsequent calls reuse it for
+    near-instant command execution. The daemon auto-exits after 15 min idle.
+
+    \b
+    Examples:
+        inspire notebook exec dev-h200 "nvidia-smi"
+        inspire notebook exec dev-h200 "python train.py" --timeout 3600
+        inspire notebook exec dev-h200 "ls -la" --json
+        inspire notebook exec dev-h200 "nvidia-smi" --session
+    """
+    run_notebook_exec(
+        ctx,
+        notebook_id=notebook,
+        command=command,
+        timeout=timeout,
+        json_output=json_output,
+        use_session=use_session,
+    )
+
+
 __all__ = [
     "create_notebook_cmd",
+    "exec_notebook_cmd",
     "list_notebooks",
     "notebook_status",
     "ssh_notebook_cmd",

@@ -8,6 +8,7 @@ surface; this module contains the SSO-only implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Optional
 
 from inspire.platform.web.browser_api.core import _browser_api_path, _get_base_url, _request_json
@@ -30,10 +31,10 @@ class ProjectInfo:
     name: str
     workspace_id: str
     # Quota fields
-    budget: float = 0.0  # Total budget allocated
-    remain_budget: float = 0.0  # Remaining budget
-    member_remain_budget: float = 0.0  # Remaining budget for current user
-    member_remain_gpu_hours: float = 0.0  # Member-level remaining GPU hours (informational)
+    budget: float | None = None  # Total budget allocated
+    remain_budget: float | None = None  # Remaining budget
+    member_remain_budget: float | None = None  # Remaining budget for current user
+    member_remain_gpu_hours: float | None = None  # Member-level remaining GPU hours (informational)
     gpu_limit: bool = False  # Whether project-level GPU-hour limits are enforced
     member_gpu_limit: bool = False  # Whether member GPU limits are enforced (informational)
     priority_level: str = ""  # Priority level (HIGH, NORMAL, etc.)
@@ -51,16 +52,34 @@ class ProjectInfo:
         return not self.gpu_limit
 
     def has_quota(self, *, needs_gpu: bool = True) -> bool:
-        """Check if the project is safe to submit GPU work to.
+        """Check if the project has enough remaining GPU quota for auto-selection.
 
-        Returns ``True`` for projects without a GPU-hour cap
-        (``gpu_limit=False``).  For capped projects (``gpu_limit=True``)
-        we cannot reliably determine remaining quota from the API, so
-        this also returns ``True`` — the scheduler will queue the job if
-        the cap is hit.  Use :attr:`gpu_unlimited` to prefer uncapped
-        projects in sorting.
+        CPU workloads always pass. For GPU workloads, treat projects as out of
+        quota when the member-level remaining quota is less than or equal to 1%
+        of the project's total budget. Prefer ``member_remain_budget`` and fall
+        back to ``member_remain_gpu_hours``. Missing or invalid values are
+        treated conservatively and keep the project selectable.
         """
-        return True
+        if not needs_gpu:
+            return True
+
+        budget = self.budget
+        if budget is None or not isfinite(budget) or budget <= 0:
+            return True
+
+        remaining: float | None = None
+        for value in (self.member_remain_budget, self.member_remain_gpu_hours):
+            if value is None:
+                continue
+            if not isfinite(value):
+                continue
+            remaining = value
+            break
+
+        if remaining is None:
+            return True
+
+        return remaining > (budget * 0.01)
 
     def get_quota_status(self, *, needs_gpu: bool = True) -> str:
         """Get formatted quota status string for display."""
@@ -105,13 +124,14 @@ def list_projects(
 
     items = data.get("data", {}).get("items", [])
 
-    def _parse_float(value) -> float:
+    def _parse_float(value) -> float | None:
         if value is None or value == "":
-            return 0.0
+            return None
         try:
-            return float(value)
+            parsed = float(value)
         except (ValueError, TypeError):
-            return 0.0
+            return None
+        return parsed if isfinite(parsed) else None
 
     return [
         ProjectInfo(

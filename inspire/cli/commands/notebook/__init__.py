@@ -14,6 +14,7 @@ import click
 
 from .notebook_commands import (
     create_notebook_cmd,
+    exec_notebook_cmd,
     list_notebooks,
     notebook_status,
     ssh_notebook_cmd,
@@ -43,4 +44,5 @@ notebook.add_command(stop_notebook_cmd)
 notebook.add_command(start_notebook_cmd)
 notebook.add_command(ssh_notebook_cmd)
 notebook.add_command(terminal_notebook_cmd)
+notebook.add_command(exec_notebook_cmd)
 notebook.add_command(notebook_top)
