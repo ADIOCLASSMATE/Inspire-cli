@@ -6,10 +6,16 @@ Command-line interface for the Inspire HPC training platform.
 
 ```bash
 # Via SSH (recommended)
-uv tool install git+ssh://git@github.com/EmbodiedForge/Inspire-cli.git
+uv tool install git+ssh://git@github.com/ADIOCLASSMATE/Inspire-cli.git
 
 # Or via HTTPS
-uv tool install git+https://github.com/EmbodiedForge/Inspire-cli.git
+uv tool install git+https://github.com/ADIOCLASSMATE/Inspire-cli.git
+```
+
+Upgrade later with:
+
+```bash
+uv tool upgrade inspire
 ```
 
 ### Local Development
@@ -46,7 +52,8 @@ inspire config check   # Validate API auth
 ```bash
 inspire resources list          # View GPU availability
 inspire notebook create --name dev --resource 4xCPU --wait
-inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
+inspire notebook terminal <id>  # Direct terminal (recommended)
+inspire notebook ssh <id>       # SSH into notebook (via rtunnel)
 ```
 
 ## Commands
@@ -63,7 +70,8 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 | `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
 | `inspire notebook list/create` | List or create notebook instances |
 | `inspire notebook start/stop` | Start or stop a notebook |
-| `inspire notebook ssh <id>` | SSH into notebook (sets up tunnel) |
+| `inspire notebook terminal <id>` | Open a direct interactive terminal via Jupyter WebSocket |
+| `inspire notebook ssh <id>` | SSH into notebook via rtunnel tunnel setup |
 | `inspire notebook top` | Show GPU utilization/memory for tunnel-backed notebooks |
 | `inspire image list/detail` | Browse Docker images |
 | `inspire image save/register` | Save or register custom images |
@@ -78,6 +86,9 @@ inspire notebook ssh <id>       # SSH into notebook (auto-installs tunnel)
 ## Examples
 
 ```bash
+# Open a realtime notebook terminal (recommended for debugging)
+inspire notebook terminal test-h100 --tmux train
+
 # Submit a training job
 inspire job create --name "train-v1" --resource "4xH200" --command "bash train.sh"
 
@@ -103,6 +114,45 @@ inspire bridge scp -d /tmp/checkpoints/ ./checkpoints/ -r --bridge mybridge
 inspire resources list
 inspire project list
 ```
+
+## Notebook access modes
+
+### Recommended: `inspire notebook terminal`
+
+Use `inspire notebook terminal <notebook> [--tmux SESSION]` for realtime interactive work.
+It connects directly to the notebook's Jupyter terminal WebSocket, so it is best for:
+
+- live terminal output
+- interactive debugging with `pdb`, `ipdb`, and `breakpoint()`
+- quick iteration from the CPU machine
+- reconnecting to a persistent tmux session
+
+Examples:
+
+```bash
+inspire notebook terminal dev-4090
+inspire notebook terminal test-h100 --tmux train
+```
+
+Disconnect with `Ctrl+]`.
+
+### `inspire notebook ssh`
+
+Use `inspire notebook ssh <notebook>` when you specifically need an SSH-based workflow or want to save a reusable bridge profile for `ssh`, `bridge exec`, `sync`, or `bridge scp`.
+
+Examples:
+
+```bash
+inspire notebook ssh <notebook-id>
+inspire notebook ssh <notebook-id> --save-as mybridge
+ssh mybridge
+```
+
+### Which one should you use?
+
+- Prefer `inspire notebook terminal` for daily debugging and interactive training.
+- Use `inspire notebook ssh` when you need SSH semantics, OpenSSH tooling, or reusable bridge profiles.
+- On this platform, the terminal workflow is typically more reliable because it avoids rtunnel and notebook-side SSH bootstrap.
 
 ## SSH/SCP Reliability Notes
 

@@ -582,8 +582,15 @@ def _ensure_playwright_browser() -> None:
         click.echo("Cannot proceed without a browser for SSO login.")
         raise SystemExit(1)
 
+    install_args = [sys.executable, "-m", "playwright", "install"]
+    # On Linux, Playwright can also install OS-level dependencies required by Chromium.
+    # Without these, Chromium may download successfully but fail to launch (e.g. missing libnss3).
+    if sys.platform.startswith("linux"):
+        install_args.append("--with-deps")
+    install_args.append("chromium")
+
     result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
+        install_args,
         capture_output=False,
     )
     if result.returncode != 0:

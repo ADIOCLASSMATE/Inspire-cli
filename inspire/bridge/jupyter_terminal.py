@@ -84,9 +84,13 @@ _WS_CLOSED_JS = "() => window.__inspireTermClosed === true"
 _WS_CLOSE_JS = """
 () => {
     if (window.__inspireTermWs) {
-        window.__inspireTermWs.close();
+        try {
+            window.__inspireTermWs.close();
+        } catch (e) {}
         window.__inspireTermWs = null;
     }
+    window.__inspireTermBuf = '';
+    window.__inspireTermClosed = true;
 }
 """
 

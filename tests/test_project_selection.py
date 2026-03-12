@@ -13,42 +13,114 @@ def _project(
     project_id: str,
     name: str,
     *,
+    budget: float | None = None,
     gpu_limit: bool = False,
     member_gpu_limit: bool = False,
-    member_remain_gpu_hours: float = 0.0,
+    member_remain_budget: float | None = None,
+    member_remain_gpu_hours: float | None = None,
     priority_name: str = "0",
 ) -> ProjectInfo:
     return ProjectInfo(
         project_id=project_id,
         name=name,
         workspace_id="ws-test",
+        budget=budget,
         gpu_limit=gpu_limit,
         member_gpu_limit=member_gpu_limit,
+        member_remain_budget=member_remain_budget,
         member_remain_gpu_hours=member_remain_gpu_hours,
         priority_name=priority_name,
     )
 
 
 # ---------------------------------------------------------------------------
-# has_quota() — always True (scheduler enforces limits, not the CLI)
+# has_quota() — 1% GPU quota threshold with conservative fallback
 # ---------------------------------------------------------------------------
 
 
-def test_has_quota_always_true_even_with_gpu_limit() -> None:
-    """has_quota() returns True regardless of gpu_limit — CLI doesn't filter."""
+def test_has_quota_true_when_member_budget_above_threshold() -> None:
     proj = _project(
         "p1",
         "Test",
+        budget=100.0,
         gpu_limit=True,
         member_gpu_limit=True,
-        member_remain_gpu_hours=-9520985.6,
-        priority_name="10",
+        member_remain_budget=1.1,
     )
     assert proj.has_quota(needs_gpu=True) is True
 
 
-def test_has_quota_true_without_gpu_limit() -> None:
-    proj = _project("p1", "Test", member_gpu_limit=False, member_remain_gpu_hours=0.0)
+def test_has_quota_false_when_member_budget_equals_threshold() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=1.0,
+    )
+    assert proj.has_quota(needs_gpu=True) is False
+
+
+def test_has_quota_false_when_member_budget_below_threshold() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=0.5,
+    )
+    assert proj.has_quota(needs_gpu=True) is False
+
+
+def test_has_quota_falls_back_to_gpu_hours() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=None,
+        member_remain_gpu_hours=1.5,
+    )
+    assert proj.has_quota(needs_gpu=True) is True
+
+
+def test_has_quota_keeps_project_when_budget_missing() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=None,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=-100.0,
+    )
+    assert proj.has_quota(needs_gpu=True) is True
+
+
+def test_has_quota_keeps_project_when_budget_zero() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=0.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=-100.0,
+    )
+    assert proj.has_quota(needs_gpu=True) is True
+
+
+def test_has_quota_keeps_project_when_remaining_values_missing() -> None:
+    proj = _project(
+        "p1",
+        "Test",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=None,
+        member_remain_gpu_hours=None,
+    )
     assert proj.has_quota(needs_gpu=True) is True
 
 
@@ -56,8 +128,9 @@ def test_has_quota_true_for_cpu_only() -> None:
     proj = _project(
         "p1",
         "Test",
+        budget=100.0,
         member_gpu_limit=True,
-        member_remain_gpu_hours=-100.0,
+        member_remain_budget=-100.0,
     )
     assert proj.has_quota(needs_gpu=False) is True
 
@@ -72,14 +145,18 @@ def test_auto_select_prefers_high_priority_among_unlimited() -> None:
     high_negative = _project(
         "p-high",
         "CI-高优先级",
+        budget=100.0,
         member_gpu_limit=True,
+        member_remain_budget=50.0,
         member_remain_gpu_hours=-490226.4,
         priority_name="10",  # HIGH
     )
     low_huge = _project(
         "p-low",
         "项目兜底任务",
+        budget=100.0,
         member_gpu_limit=True,
+        member_remain_budget=20.0,
         member_remain_gpu_hours=2399383493.5,
         priority_name="2",  # LOW
     )
@@ -87,6 +164,7 @@ def test_auto_select_prefers_high_priority_among_unlimited() -> None:
         "p-normal",
         "分布式测试",
         member_gpu_limit=False,
+        member_remain_budget=None,
         member_remain_gpu_hours=0.0,
         priority_name="4",  # NORMAL
     )
@@ -125,19 +203,29 @@ def test_auto_select_breaks_tie_by_name() -> None:
     assert selected.project_id == "p-a"
 
 
-def test_auto_select_negative_gpu_hours_selectable() -> None:
-    """Projects with negative member_remain_gpu_hours are still selectable."""
-    proj = _project(
-        "p1",
-        "Only Project",
+def test_auto_select_skips_low_quota_project() -> None:
+    low_quota = _project(
+        "p-low",
+        "Low Quota",
+        budget=100.0,
+        gpu_limit=True,
         member_gpu_limit=True,
-        member_remain_gpu_hours=-186350.6,
+        member_remain_budget=1.0,
         priority_name="10",
     )
+    healthy = _project(
+        "p-healthy",
+        "Healthy Project",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=5.0,
+        priority_name="4",
+    )
 
-    selected, message = select_project([proj])
+    selected, message = select_project([low_quota, healthy])
 
-    assert selected.project_id == "p1"
+    assert selected.project_id == "p-healthy"
     assert message is None
 
 
@@ -151,7 +239,9 @@ def test_select_project_requested_returns_directly() -> None:
     requested = _project(
         "project-requested",
         "Requested Project",
+        budget=100.0,
         member_gpu_limit=True,
+        member_remain_budget=5.0,
         member_remain_gpu_hours=-10.0,
         priority_name="10",
     )
@@ -159,6 +249,7 @@ def test_select_project_requested_returns_directly() -> None:
         "project-other",
         "Other Project",
         member_gpu_limit=False,
+        member_remain_budget=None,
         member_remain_gpu_hours=0.0,
         priority_name="4",
     )
@@ -176,7 +267,9 @@ def test_select_project_requested_over_quota_allowed_for_cpu() -> None:
     requested = _project(
         "project-requested",
         "Requested Project",
+        budget=100.0,
         member_gpu_limit=True,
+        member_remain_budget=1.0,
         member_remain_gpu_hours=-10.0,
         priority_name="10",
     )
@@ -184,6 +277,7 @@ def test_select_project_requested_over_quota_allowed_for_cpu() -> None:
         "project-fallback",
         "Fallback Project",
         member_gpu_limit=False,
+        member_remain_budget=None,
         member_remain_gpu_hours=0.0,
         priority_name="4",
     )
@@ -198,7 +292,68 @@ def test_select_project_requested_over_quota_allowed_for_cpu() -> None:
     assert message is None
 
 
-def test_select_project_requested_not_found_raises() -> None:
+def test_select_project_requested_over_quota_allowed_for_gpu() -> None:
+    requested = _project(
+        "project-requested",
+        "Requested Project",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=1.0,
+        priority_name="10",
+    )
+    fallback = _project(
+        "project-fallback",
+        "Fallback Project",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=10.0,
+        priority_name="4",
+    )
+
+    selected, message = select_project(
+        [requested, fallback],
+        requested="project-requested",
+        allow_requested_over_quota=True,
+    )
+
+    assert selected.project_id == "project-requested"
+    assert message is not None
+    assert "continuing with the explicitly requested project" in message
+
+
+def test_select_project_requested_over_quota_falls_back_when_not_allowed() -> None:
+    requested = _project(
+        "project-requested",
+        "Requested Project",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=1.0,
+        priority_name="10",
+    )
+    fallback = _project(
+        "project-fallback",
+        "Fallback Project",
+        budget=100.0,
+        gpu_limit=True,
+        member_gpu_limit=True,
+        member_remain_budget=10.0,
+        priority_name="4",
+    )
+
+    selected, message = select_project(
+        [requested, fallback],
+        requested="project-requested",
+        allow_requested_over_quota=False,
+    )
+
+    assert selected.project_id == "project-fallback"
+    assert message is not None
+    assert "is over quota; using 'Fallback Project'" in message
+
+
     proj = _project("p1", "Exists", priority_name="4")
 
     with pytest.raises(ValueError, match="not found"):
@@ -214,7 +369,9 @@ def test_resolve_notebook_project_passes_quota_and_shared_path_settings(monkeypa
     requested = _project(
         "project-requested",
         "Requested Project",
+        budget=100.0,
         member_gpu_limit=True,
+        member_remain_budget=5.0,
         member_remain_gpu_hours=-10.0,
         priority_name="10",
     )
