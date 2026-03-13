@@ -17,11 +17,13 @@ from .notebook_commands import (
     exec_notebook_cmd,
     list_notebooks,
     notebook_status,
+    reusable_notebook_cmd,
     ssh_notebook_cmd,
     start_notebook_cmd,
     stop_notebook_cmd,
     terminal_notebook_cmd,
 )
+from .notebook_exec_session_commands import exec_session_group
 from .top import notebook_top
 
 
@@ -38,6 +40,7 @@ def notebook():
 
 
 notebook.add_command(list_notebooks)
+notebook.add_command(reusable_notebook_cmd)
 notebook.add_command(notebook_status)
 notebook.add_command(create_notebook_cmd)
 notebook.add_command(stop_notebook_cmd)
@@ -45,4 +48,5 @@ notebook.add_command(start_notebook_cmd)
 notebook.add_command(ssh_notebook_cmd)
 notebook.add_command(terminal_notebook_cmd)
 notebook.add_command(exec_notebook_cmd)
+notebook.add_command(exec_session_group)
 notebook.add_command(notebook_top)

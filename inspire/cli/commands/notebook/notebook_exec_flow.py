@@ -9,15 +9,62 @@ connection alive in a background daemon for near-instant subsequent commands.
 
 from __future__ import annotations
 
+import re
+import shlex
 import sys
 from typing import Any
 
 import click
 
-from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_CONFIG_ERROR
+from inspire.cli.context import Context, EXIT_API_ERROR, EXIT_CONFIG_ERROR, EXIT_VALIDATION_ERROR
 from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.cli.utils.notebook_cli import get_base_url, load_config, require_web_session
+
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _build_exec_command(
+    ctx: Context,
+    *,
+    command: str,
+    cwd: str | None,
+    env_vars: tuple[str, ...],
+) -> str:
+    """Build a single shell command applying --env/--cwd before the user command."""
+    if not cwd and not env_vars:
+        return command
+
+    exports: list[str] = []
+    for item in env_vars:
+        if "=" not in item:
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Invalid --env value: {item!r} (expected KEY=VAL)",
+                EXIT_VALIDATION_ERROR,
+            )
+            raise SystemExit(EXIT_VALIDATION_ERROR)
+        key, value = item.split("=", 1)
+        if not _ENV_KEY_RE.match(key):
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Invalid --env key: {key!r} (must match {_ENV_KEY_RE.pattern})",
+                EXIT_VALIDATION_ERROR,
+            )
+            raise SystemExit(EXIT_VALIDATION_ERROR)
+        exports.append(f"export {key}={shlex.quote(value)}")
+
+    prefix_parts: list[str] = []
+    if exports:
+        prefix_parts.append(" && ".join(exports))
+    if cwd:
+        prefix_parts.append(f"cd {shlex.quote(cwd)}")
+
+    prefix = " && ".join(prefix_parts)
+    return f"{prefix} && {command}" if prefix else command
 
 
 def run_notebook_exec(
@@ -28,6 +75,8 @@ def run_notebook_exec(
     timeout: int = 120,
     json_output: bool = False,
     use_session: bool = False,
+    cwd: str | None = None,
+    env_vars: tuple[str, ...] = (),
 ) -> None:
     """Execute *command* on a notebook and stream output to stdout."""
     from inspire.cli.commands.notebook.notebook_lookup import _resolve_notebook_id
@@ -51,6 +100,8 @@ def run_notebook_exec(
         identifier=notebook_id,
         json_output=json_output,
     )
+
+    command = _build_exec_command(ctx, command=command, cwd=cwd, env_vars=env_vars)
 
     if use_session:
         _exec_via_session(
@@ -258,9 +309,7 @@ def _exec_via_playwright_sync(
 
             # Wait for Jupyter UI to settle
             try:
-                lab_frame.locator("text=加载中").first.wait_for(
-                    state="hidden", timeout=15000
-                )
+                lab_frame.locator("text=加载中").first.wait_for(state="hidden", timeout=15000)
             except Exception:
                 pass
 
@@ -335,8 +384,6 @@ def _exec_via_playwright_sync(
         finally:
             if term_name and lab_frame:
                 try:
-                    _delete_terminal_via_api(
-                        context, lab_url=lab_frame.url, term_name=term_name
-                    )
+                    _delete_terminal_via_api(context, lab_url=lab_frame.url, term_name=term_name)
                 except Exception:
                     pass

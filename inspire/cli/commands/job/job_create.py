@@ -37,6 +37,7 @@ def run_job_create(
     workspace_id_override: str | None,
     auto: bool,
     image: str | None,
+    log_file: str | None,
     project: str | None,
     nodes: int,
 ) -> None:
@@ -167,6 +168,7 @@ def run_job_create(
                 nodes=nodes,
                 max_time_hours=max_time,
                 project_name=selected.name,
+                log_file=log_file,
             )
         except ValueError as e:
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -250,6 +252,14 @@ def run_job_create(
     help="Custom Docker image (default from config [job].image)",
 )
 @click.option(
+    "--log-file",
+    default=None,
+    help=(
+        "Remote log file path (absolute). Overrides the default ${INSPIRE_TARGET_DIR}/.inspire/"
+        "training_master_<timestamp>.log"
+    ),
+)
+@click.option(
     "--project",
     "-p",
     default=None,
@@ -275,6 +285,7 @@ def create(
     workspace_id_override: Optional[str],
     auto: bool,
     image: Optional[str],
+    log_file: Optional[str],
     project: Optional[str],
     nodes: int,
 ) -> None:
@@ -317,6 +328,7 @@ def create(
         workspace_id_override=workspace_id_override,
         auto=auto,
         image=image,
+        log_file=log_file,
         project=project,
         nodes=nodes,
     )
