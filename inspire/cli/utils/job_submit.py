@@ -35,17 +35,30 @@ def wrap_in_bash(command: str) -> str:
     return f"bash -c '{escaped}'"
 
 
-def build_remote_logged_command(config: Config, *, command: str) -> tuple[str, str | None]:
-    """Build the remote command (with optional logging) and return (final_command, log_path)."""
+def build_remote_logged_command(
+    config: Config,
+    *,
+    command: str,
+    log_path_override: str | None = None,
+) -> tuple[str, str | None]:
+    """Build the remote command (with optional logging) and return (final_command, log_path).
+
+    If *log_path_override* is provided, it will be used as the log file path.
+    """
     env_exports = build_env_exports(config.remote_env)
     final_command = f"{env_exports}{command}" if env_exports else command
 
     log_path = None
     if config.target_dir:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        log_dir = os.path.join(config.target_dir, ".inspire")
-        log_filename = f"training_master_{timestamp}.log"
-        log_path = os.path.join(log_dir, log_filename)
+        if log_path_override:
+            log_path = log_path_override
+            log_dir = os.path.dirname(log_path)
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            log_dir = os.path.join(config.target_dir, ".inspire")
+            log_filename = f"training_master_{timestamp}.log"
+            log_path = os.path.join(log_dir, log_filename)
+
         final_command = (
             f'{env_exports}mkdir -p "{log_dir}" && ( cd "{config.target_dir}" && {command} ) '
             f'> "{log_path}" 2>&1'
@@ -137,9 +150,14 @@ def submit_training_job(
     nodes: int,
     max_time_hours: float,
     project_name: Optional[str] = None,
+    log_file: str | None = None,
 ) -> JobSubmission:
     wrapped_command = wrap_in_bash(command)
-    final_command, log_path = build_remote_logged_command(config, command=wrapped_command)
+    final_command, log_path = build_remote_logged_command(
+        config,
+        command=wrapped_command,
+        log_path_override=log_file,
+    )
 
     max_time_ms = str(int(max_time_hours * 3600 * 1000))
 

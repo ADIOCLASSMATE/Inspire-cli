@@ -53,15 +53,33 @@ inspire config check   # Validate API auth
 inspire resources list          # View GPU availability
 inspire notebook create --name dev --resource 4xCPU --wait
 inspire notebook terminal <id>  # Direct terminal (recommended)
+# NOTE: in some production H100/H200 environments, SSH-based notebook access may be unavailable
+# due to rtunnel bootstrap restrictions. Prefer `notebook terminal/exec` in that case.
 inspire notebook ssh <id>       # SSH into notebook (via rtunnel)
 ```
 
+## Production notes (H100/H200, no SSH)
+
+In some production environments (especially offline H100/H200), SSH-based features may be unavailable because the notebook-side `rtunnel` bootstrap cannot complete.
+
+When SSH is not available:
+
+- Prefer **Jupyter WebSocket-based flows**:
+  - `inspire notebook terminal <id>` (interactive; recommended)
+  - `inspire notebook exec <id> "<cmd>"` (non-interactive)
+  - `inspire notebook exec --session ...` / `inspire notebook exec-session ...` (persistent exec session)
+- The following commands may fail (depending on tunnel availability):
+  - `inspire notebook ssh`, `inspire tunnel ...`, `inspire bridge ...`
+  - `inspire sync`
+  - `inspire job logs` (can require tunnel/SSH fast-path)
+
+Tip (shell quoting): when checking env vars through `notebook exec`, remember your **local shell expands `$VAR`** first. Use `\$VAR` (or single quotes) so the *remote* shell prints it.
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `inspire job create` | Submit a training job |
-| `inspire job status/logs/list` | Monitor and manage jobs |
+| `inspire job status/logs/list` | Monitor and manage jobs (status/logs may require API/tunnel availability) |
 | `inspire job stop/wait` | Stop or wait for a job |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
 | `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
@@ -139,6 +157,8 @@ Disconnect with `Ctrl+]`.
 ### `inspire notebook ssh`
 
 Use `inspire notebook ssh <notebook>` when you specifically need an SSH-based workflow or want to save a reusable bridge profile for `ssh`, `bridge exec`, `sync`, or `bridge scp`.
+
+Important: on some offline H100/H200 environments, `notebook ssh` may fail if the notebook-side rtunnel/bootstrap cannot start. In that case, use `inspire notebook terminal` / `inspire notebook exec` instead.
 
 Examples:
 

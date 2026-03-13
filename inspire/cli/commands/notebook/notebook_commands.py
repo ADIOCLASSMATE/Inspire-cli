@@ -7,23 +7,35 @@ from typing import Optional
 
 import click
 
-from .notebook_create_flow import maybe_run_post_start, run_notebook_create
+from .notebook_create_flow import (
+    format_resource_display,
+    match_gpu_type,
+    maybe_run_post_start,
+    parse_resource_string,
+    run_notebook_create,
+)
 from .notebook_exec_flow import run_notebook_exec
 from .notebook_lookup import (
     _ZERO_WORKSPACE_ID,
+    _collect_all_workspace_ids,
+    _format_notebook_resource,
     _list_notebooks_for_workspace,
+    _list_notebooks_for_workspace_paginated,
+    _notebook_id_from_item,
     _resolve_notebook_id,
     _sort_notebook_items,
     _try_get_current_user_ids,
     _unique_workspace_ids,
 )
 from .notebook_presenters import _print_notebook_detail, _print_notebook_list
+from .notebook_reusable_flow import check_notebook_idle_via_nvidia_smi
 from .notebook_ssh_flow import run_notebook_ssh
 from .notebook_terminal_flow import run_notebook_terminal
 from inspire.cli.context import (
     Context,
     EXIT_API_ERROR,
     EXIT_CONFIG_ERROR,
+    EXIT_VALIDATION_ERROR,
     pass_context,
 )
 from inspire.cli.formatters import json_formatter
@@ -482,6 +494,145 @@ def notebook_status(
     return
 
 
+@click.command("reusable")
+@click.option(
+    "--resource",
+    "-r",
+    required=True,
+    help="Resource spec (e.g., 1xH200, 4xH100, 4CPU)",
+)
+@pass_context
+def reusable_notebook_cmd(
+    ctx: Context,
+    resource: str,
+) -> None:
+    """Find reusable running notebooks (always JSON output)."""
+
+    # Force JSON output regardless of global flags.
+    ctx.json_output = True
+
+    try:
+        gpu_count_req, gpu_pattern_req, cpu_count_req = parse_resource_string(resource)
+    except ValueError as e:
+        _handle_error(ctx, "ValidationError", str(e), EXIT_VALIDATION_ERROR)
+        return
+
+    session = require_web_session(
+        ctx,
+        hint=(
+            "Finding reusable notebooks requires web authentication. "
+            "Set [auth].username/password in config.toml or "
+            "INSPIRE_USERNAME/INSPIRE_PASSWORD."
+        ),
+    )
+    config = load_config(ctx)
+    base_url = get_base_url()
+
+    workspace_ids = _collect_all_workspace_ids(session, config)
+    if not workspace_ids:
+        _handle_error(
+            ctx,
+            "ConfigError",
+            "No workspace_id configured or available for notebook lookup.",
+            EXIT_CONFIG_ERROR,
+            hint=(
+                "Set [workspaces].cpu/[workspaces].gpu in config.toml, set INSPIRE_WORKSPACE_ID, "
+                "or login again to discover accessible workspaces."
+            ),
+        )
+        return
+
+    user_ids = _try_get_current_user_ids(session, base_url=base_url)
+
+    candidates: list[dict] = []
+    for ws_id in workspace_ids:
+        try:
+            items = _list_notebooks_for_workspace_paginated(
+                session,
+                base_url=base_url,
+                workspace_id=ws_id,
+                user_ids=user_ids,
+                status=["RUNNING"],
+            )
+        except Exception:
+            continue
+
+        for item in items:
+            item_copy = dict(item)
+            item_copy["workspace_id"] = ws_id
+            candidates.append(item_copy)
+
+    matched: list[dict] = []
+
+    req_resource_display = format_resource_display(gpu_count_req, gpu_pattern_req, cpu_count_req)
+
+    for item in candidates:
+        quota = item.get("quota") or {}
+        gpu_count_item = int(quota.get("gpu_count", 0) or 0)
+        cpu_count_item = quota.get("cpu_count")
+
+        gpu_type_item = ""
+        if gpu_count_item > 0:
+            # GPU type may appear in different places depending on API response.
+            gpu_info = (item.get("resource_spec_price") or {}).get("gpu_info") or {}
+            node_gpu_info = (item.get("node") or {}).get("gpu_info") or {}
+            gpu_type_item = str(
+                gpu_info.get("gpu_product_simple")
+                or gpu_info.get("gpu_type_display")
+                or node_gpu_info.get("gpu_product_simple")
+                or node_gpu_info.get("gpu_type_display")
+                or node_gpu_info.get("gpu_type")
+                or quota.get("gpu_type")
+                or "GPU"
+            )
+
+        # Strict match
+        if gpu_count_req == 0 and gpu_pattern_req.upper() == "CPU":
+            if gpu_count_item != 0:
+                continue
+            if cpu_count_req is not None and cpu_count_item is not None:
+                try:
+                    if int(cpu_count_item) != int(cpu_count_req):
+                        continue
+                except Exception:
+                    pass
+        else:
+            if gpu_count_item != gpu_count_req:
+                continue
+            if gpu_pattern_req.upper() != "GPU":
+                if not match_gpu_type(gpu_pattern_req, gpu_type_item):
+                    continue
+
+        notebook_id = _notebook_id_from_item(item)
+        if not notebook_id:
+            continue
+
+        # Idle check for GPU notebooks only
+        if gpu_count_req > 0:
+            if not check_notebook_idle_via_nvidia_smi(notebook_id=notebook_id, session=session):
+                continue
+
+        matched.append(
+            {
+                "id": notebook_id,
+                "name": str(item.get("name") or ""),
+                "workspace_id": str(item.get("workspace_id") or ""),
+                "resource": req_resource_display,
+                "status": str(item.get("status") or ""),
+                "resource_detail": _format_notebook_resource(item),
+            }
+        )
+
+    click.echo(
+        json_formatter.format_json(
+            {
+                "total": len(matched),
+                "items": matched,
+            }
+        )
+    )
+
+
 @click.command("list")
 @click.option(
     "--workspace",
@@ -824,6 +975,17 @@ def terminal_notebook_cmd(
     is_flag=True,
     help="Use persistent session (keeps browser open for fast repeated commands)",
 )
+@click.option(
+    "--cwd",
+    default=None,
+    help="Working directory on the notebook (prepends 'cd ... &&')",
+)
+@click.option(
+    "--env",
+    "env_vars",
+    multiple=True,
+    help="Environment variables (repeatable, KEY=VAL). Prepends 'export ...'",
+)
 @pass_context
 def exec_notebook_cmd(
     ctx: Context,
@@ -832,6 +994,8 @@ def exec_notebook_cmd(
     timeout: int,
     json_output: bool,
     use_session: bool,
+    cwd: str | None,
+    env_vars: tuple[str, ...],
 ) -> None:
     """Execute a command on a notebook and capture output.
 
@@ -856,6 +1020,8 @@ def exec_notebook_cmd(
         timeout=timeout,
         json_output=json_output,
         use_session=use_session,
+        cwd=cwd,
+        env_vars=env_vars,
     )
 
 

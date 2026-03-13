@@ -246,6 +246,66 @@ def _list_notebooks_for_workspace(
     return [item for item in items if isinstance(item, dict)]
 
 
+def _list_notebooks_for_workspace_paginated(
+    session: web_session_module.WebSession,
+    *,
+    base_url: str,
+    workspace_id: str,
+    user_ids: list[str],
+    keyword: str = "",
+    page_size: int = 200,
+    status: list[str] | None = None,
+    max_pages: int = 50,
+) -> list[dict]:
+    """List notebooks with pagination.
+
+    Stops when:
+    - API returns empty list
+    - list length < page_size
+    - max_pages reached (safety cap)
+    """
+
+    all_items: list[dict] = []
+    for page in range(1, max_pages + 1):
+        body = {
+            "workspace_id": workspace_id,
+            "page": page,
+            "page_size": page_size,
+            "filter_by": {
+                "keyword": keyword,
+                "user_id": user_ids,
+                "logic_compute_group_id": [],
+                "status": status or [],
+                "mirror_url": [],
+            },
+            "order_by": [{"field": "created_at", "order": "desc"}],
+        }
+
+        data = web_session_module.request_json(
+            session,
+            "POST",
+            f"{base_url}/api/v1/notebook/list",
+            body=body,
+            timeout=30,
+        )
+
+        if data.get("code") != 0:
+            message = data.get("message", "Unknown error")
+            raise ValueError(f"API error: {message}")
+
+        items = data.get("data", {}).get("list", [])
+        if not isinstance(items, list) or not items:
+            break
+
+        page_items = [item for item in items if isinstance(item, dict)]
+        all_items.extend(page_items)
+
+        if len(items) < page_size:
+            break
+
+    return all_items
+
+
 def _collect_workspace_ids_for_lookup(
     session: web_session_module.WebSession,
     config: Any,
@@ -280,6 +340,24 @@ def _collect_workspace_ids_for_lookup(
     if resolved_ws and resolved_ws != _ZERO_WORKSPACE_ID:
         return [str(resolved_ws)]
     return []
+
+
+def _collect_all_workspace_ids(
+    session: web_session_module.WebSession,
+    config: Any,
+) -> list[str]:
+    """Collect workspace IDs across all accessible projects/workspaces.
+
+    Priority:
+    1) session.all_workspace_ids (discovered at login)
+    2) fallback to config-driven workspace discovery
+    """
+
+    all_ids = getattr(session, "all_workspace_ids", None)
+    if isinstance(all_ids, list) and all_ids:
+        return _unique_workspace_ids([str(x) for x in all_ids if x])
+
+    return _collect_workspace_ids_for_lookup(session, config)
 
 
 def _resolve_partial_notebook_id(
@@ -451,10 +529,12 @@ def _resolve_notebook_id(
 
 __all__ = [
     "_ZERO_WORKSPACE_ID",
+    "_collect_all_workspace_ids",
     "_collect_workspace_ids_for_lookup",
     "_format_notebook_resource",
     "_get_current_user_detail",
     "_list_notebooks_for_workspace",
+    "_list_notebooks_for_workspace_paginated",
     "_looks_like_notebook_id",
     "_notebook_id_from_item",
     "_resolve_notebook_id",

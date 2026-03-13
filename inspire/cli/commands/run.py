@@ -80,7 +80,10 @@ def _exec_inspire_subcommand(args: list[str]) -> None:
     os.execv(exe, [exe, *args])
 
 
-def _run_sync_if_requested(ctx: Context, *, sync: bool, watch: bool) -> None:
+def _run_sync_if_requested(ctx: Context, *, sync: bool, watch: bool, no_sync: bool) -> None:
+    if no_sync:
+        return
+
     if not (sync or watch):
         return
 
@@ -184,6 +187,7 @@ def _run_flow(
     name: str | None,
     sync: bool,
     watch: bool,
+    no_sync: bool,
     priority: int | None,
     location: str | None,
     workspace: str | None,
@@ -192,8 +196,9 @@ def _run_flow(
     image: str | None,
     nodes: int,
     project: str | None,
+    log_file: str | None,
 ) -> None:
-    _run_sync_if_requested(ctx, sync=sync, watch=watch)
+    _run_sync_if_requested(ctx, sync=sync, watch=watch, no_sync=no_sync)
 
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True)
@@ -275,6 +280,7 @@ def _run_flow(
                 nodes=nodes,
                 max_time_hours=max_time,
                 project_name=selected_project.name,
+                log_file=log_file,
             )
         except ValueError as e:
             _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
@@ -305,6 +311,8 @@ def _run_flow(
             click.echo(json_formatter.format_json(data))
         else:
             click.echo(f"Job created: {job_id}")
+            if log_path:
+                click.echo(f"Log file:  {log_path}")
             if ctx.debug:
                 click.echo(f"Name: {name}")
                 click.echo(f"Resource: {resource_str}")
@@ -313,8 +321,6 @@ def _run_flow(
                 click.echo(
                     f"Command: {wrapped_command[:80]}{'...' if len(wrapped_command) > 80 else ''}"
                 )
-                if log_path:
-                    click.echo(f"Log file: {log_path}")
                 click.echo(f"Check status with: inspire job status {job_id}")
 
         if watch:
@@ -352,6 +358,7 @@ def _run_flow(
 )
 @click.option("--name", "-n", help="Job name (auto-generated if not specified)")
 @click.option("--sync", "-s", is_flag=True, help="Sync code before running")
+@click.option("--no-sync", is_flag=True, help="Do not sync code (even with --watch)")
 @click.option("--watch", "-w", is_flag=True, help="Sync, run, then follow logs")
 @click.option(
     "--priority",
@@ -381,6 +388,14 @@ def _run_flow(
 @click.option(
     "--nodes", type=int, default=1, help="Number of nodes for multi-node training (default: 1)"
 )
+@click.option(
+    "--log-file",
+    default=None,
+    help=(
+        "Remote log file path (absolute). Overrides the default ${INSPIRE_TARGET_DIR}/.inspire/"
+        "training_master_<timestamp>.log"
+    ),
+)
 @pass_context
 def run(
     ctx: Context,
@@ -389,6 +404,7 @@ def run(
     gpu_type: str,
     name: str | None,
     sync: bool,
+    no_sync: bool,
     watch: bool,
     priority: int | None,
     project: str | None,
@@ -398,6 +414,7 @@ def run(
     max_time: float,
     image: str | None,
     nodes: int,
+    log_file: str | None,
 ) -> None:
     """Quick job submission with smart resource allocation.
 
@@ -412,10 +429,18 @@ def run(
 
     \b
     With --watch:
-        1. Sync code (if --sync or --watch)
+        1. Sync code (if --sync or --watch, unless --no-sync)
         2. Create job
         3. Follow logs until completion
     """
+    if sync and no_sync:
+        _handle_error(
+            ctx,
+            "ValidationError",
+            "--sync and --no-sync are mutually exclusive",
+            EXIT_VALIDATION_ERROR,
+        )
+
     _run_flow(
         ctx,
         command=command,
@@ -424,6 +449,7 @@ def run(
         name=name,
         sync=sync,
         watch=watch,
+        no_sync=no_sync,
         priority=priority,
         project=project,
         location=location,
@@ -432,6 +458,7 @@ def run(
         max_time=max_time,
         image=image,
         nodes=nodes,
+        log_file=log_file,
     )
 
 
