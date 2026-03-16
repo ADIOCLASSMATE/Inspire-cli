@@ -111,3 +111,38 @@ def test_notebook_exec_session_start_rejects_bad_env(monkeypatch: pytest.MonkeyP
         ],
     )
     assert res.exit_code == EXIT_VALIDATION_ERROR
+
+
+def test_notebook_exec_session_list_json_includes_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    from inspire.cli.commands.notebook import notebook_exec_session_commands as mod
+
+    class FakeSession:
+        storage_state = {}
+
+    # Pretend there's one session socket
+    monkeypatch.setattr(mod.glob, "glob", lambda pattern: ["/tmp/inspire-exec-sessions/nb-1.sock"])
+
+    class FakeInfo:
+        notebook_id = "nb-1"
+        pid = 4321
+        socket_path = "/tmp/inspire-exec-sessions/nb-1.sock"
+
+    monkeypatch.setattr(mod, "get_session_info", lambda notebook_id: FakeInfo())
+
+    # Patch auth and API
+    monkeypatch.setattr(mod, "require_web_session", lambda ctx, hint: FakeSession())
+    monkeypatch.setattr(mod, "get_base_url", lambda: "https://example.invalid")
+
+    def fake_request_json(session, method, url, **kwargs):  # type: ignore[no-untyped-def]
+        assert method == "GET"
+        assert url.endswith("/api/v1/notebook/nb-1")
+        return {"code": 0, "data": {"name": "dev-h200"}}
+
+    monkeypatch.setattr(mod.web_session_module, "request_json", fake_request_json)
+
+    runner = CliRunner()
+    res = runner.invoke(cli_main, ["--json", "notebook", "exec-session", "list"])
+    assert res.exit_code == EXIT_SUCCESS
+
+    # json_formatter returns a string; simplest check is substring presence
+    assert '"name": "dev-h200"' in res.output

@@ -28,7 +28,7 @@ from .notebook_lookup import (
     _unique_workspace_ids,
 )
 from .notebook_presenters import _print_notebook_detail, _print_notebook_list
-from .notebook_reusable_flow import check_notebook_idle_via_nvidia_smi
+from .notebook_reusable_flow import NotebookIdleProbe, check_notebook_idle_via_nvidia_smi
 from .notebook_ssh_flow import run_notebook_ssh
 from .notebook_terminal_flow import run_notebook_terminal
 from inspire.cli.context import (
@@ -501,10 +501,34 @@ def notebook_status(
     required=True,
     help="Resource spec (e.g., 1xH200, 4xH100, 4CPU)",
 )
+@click.option(
+    "--all",
+    "list_all",
+    is_flag=True,
+    help="List all reusable notebooks (default: stop after first match)",
+)
+@click.option(
+    "--samples",
+    type=click.IntRange(1, 10),
+    default=1,
+    show_default=True,
+    help="nvidia-smi samples per notebook (GPU only)",
+)
+@click.option(
+    "--lab-timeout",
+    "lab_timeout_ms",
+    type=int,
+    default=20000,
+    show_default=True,
+    help="Timeout (ms) for opening JupyterLab when probing idleness (GPU only)",
+)
 @pass_context
 def reusable_notebook_cmd(
     ctx: Context,
     resource: str,
+    list_all: bool,
+    samples: int,
+    lab_timeout_ms: int,
 ) -> None:
     """Find reusable running notebooks (always JSON output)."""
 
@@ -566,62 +590,90 @@ def reusable_notebook_cmd(
 
     req_resource_display = format_resource_display(gpu_count_req, gpu_pattern_req, cpu_count_req)
 
-    for item in candidates:
-        quota = item.get("quota") or {}
-        gpu_count_item = int(quota.get("gpu_count", 0) or 0)
-        cpu_count_item = quota.get("cpu_count")
+    probe_cm = None
+    probe = None
+    if gpu_count_req > 0:
+        probe_cm = NotebookIdleProbe(session)
+        try:
+            probe = probe_cm.__enter__()
+        except Exception:
+            # If probe fails to start, treat all as non-idle.
+            probe = None
 
-        gpu_type_item = ""
-        if gpu_count_item > 0:
-            # GPU type may appear in different places depending on API response.
-            gpu_info = (item.get("resource_spec_price") or {}).get("gpu_info") or {}
-            node_gpu_info = (item.get("node") or {}).get("gpu_info") or {}
-            gpu_type_item = str(
-                gpu_info.get("gpu_product_simple")
-                or gpu_info.get("gpu_type_display")
-                or node_gpu_info.get("gpu_product_simple")
-                or node_gpu_info.get("gpu_type_display")
-                or node_gpu_info.get("gpu_type")
-                or quota.get("gpu_type")
-                or "GPU"
-            )
+    try:
+        for item in candidates:
+            quota = item.get("quota") or {}
+            gpu_count_item = int(quota.get("gpu_count", 0) or 0)
+            cpu_count_item = quota.get("cpu_count")
 
-        # Strict match
-        if gpu_count_req == 0 and gpu_pattern_req.upper() == "CPU":
-            if gpu_count_item != 0:
-                continue
-            if cpu_count_req is not None and cpu_count_item is not None:
-                try:
-                    if int(cpu_count_item) != int(cpu_count_req):
+            gpu_type_item = ""
+            if gpu_count_item > 0:
+                # GPU type may appear in different places depending on API response.
+                gpu_info = (item.get("resource_spec_price") or {}).get("gpu_info") or {}
+                node_gpu_info = (item.get("node") or {}).get("gpu_info") or {}
+                gpu_type_item = str(
+                    gpu_info.get("gpu_product_simple")
+                    or gpu_info.get("gpu_type_display")
+                    or node_gpu_info.get("gpu_product_simple")
+                    or node_gpu_info.get("gpu_type_display")
+                    or node_gpu_info.get("gpu_type")
+                    or quota.get("gpu_type")
+                    or "GPU"
+                )
+
+            # Strict match
+            if gpu_count_req == 0 and gpu_pattern_req.upper() == "CPU":
+                if gpu_count_item != 0:
+                    continue
+                if cpu_count_req is not None and cpu_count_item is not None:
+                    try:
+                        if int(cpu_count_item) != int(cpu_count_req):
+                            continue
+                    except Exception:
+                        pass
+            else:
+                if gpu_count_item != gpu_count_req:
+                    continue
+                if gpu_pattern_req.upper() != "GPU":
+                    if not match_gpu_type(gpu_pattern_req, gpu_type_item):
                         continue
-                except Exception:
-                    pass
-        else:
-            if gpu_count_item != gpu_count_req:
+
+            notebook_id = _notebook_id_from_item(item)
+            if not notebook_id:
                 continue
-            if gpu_pattern_req.upper() != "GPU":
-                if not match_gpu_type(gpu_pattern_req, gpu_type_item):
+
+            # Idle check for GPU notebooks only
+            if gpu_count_req > 0:
+                if probe is None:
+                    continue
+                if not check_notebook_idle_via_nvidia_smi(
+                    notebook_id=notebook_id,
+                    session=session,
+                    probe=probe,
+                    samples=samples,
+                    lab_timeout_ms=lab_timeout_ms,
+                ):
                     continue
 
-        notebook_id = _notebook_id_from_item(item)
-        if not notebook_id:
-            continue
+            matched.append(
+                {
+                    "id": notebook_id,
+                    "name": str(item.get("name") or ""),
+                    "workspace_id": str(item.get("workspace_id") or ""),
+                    "resource": req_resource_display,
+                    "status": str(item.get("status") or ""),
+                    "resource_detail": _format_notebook_resource(item),
+                }
+            )
 
-        # Idle check for GPU notebooks only
-        if gpu_count_req > 0:
-            if not check_notebook_idle_via_nvidia_smi(notebook_id=notebook_id, session=session):
-                continue
-
-        matched.append(
-            {
-                "id": notebook_id,
-                "name": str(item.get("name") or ""),
-                "workspace_id": str(item.get("workspace_id") or ""),
-                "resource": req_resource_display,
-                "status": str(item.get("status") or ""),
-                "resource_detail": _format_notebook_resource(item),
-            }
-        )
+            if matched and not list_all:
+                break
+    finally:
+        if probe_cm is not None:
+            try:
+                probe_cm.__exit__(None, None, None)
+            except Exception:
+                pass
 
     click.echo(
         json_formatter.format_json(

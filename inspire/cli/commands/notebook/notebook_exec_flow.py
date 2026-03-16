@@ -9,6 +9,7 @@ connection alive in a background daemon for near-instant subsequent commands.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import sys
@@ -126,6 +127,43 @@ def run_notebook_exec(
         )
 
 
+def _maybe_init_session_cwd(
+    *,
+    ctx: Context,
+    client,
+    notebook_id: str,
+    json_output: bool,
+) -> None:
+    """Best-effort: set session cwd to current local directory.
+
+    This runs only right after a new exec-session daemon is started.
+
+    NOTE: We intentionally do not fail the exec if this init step fails,
+    because the target notebook filesystem may not mirror the local path.
+    """
+
+    init_cwd = os.getcwd()
+    init_cmd = f"cd {shlex.quote(init_cwd)} && pwd"
+
+    try:
+        output, exit_code = client.exec_command(init_cmd, timeout=30, on_output=None)
+        if exit_code != 0 and not json_output:
+            click.echo(
+                f"Warning: failed to init session cwd to {init_cwd!r} for {notebook_id}. "
+                "Continuing with default remote cwd.",
+                err=True,
+            )
+            if output:
+                click.echo(output, err=True)
+    except Exception as e:
+        if not json_output:
+            click.echo(
+                f"Warning: failed to init session cwd to {init_cwd!r} for {notebook_id}: {e}. "
+                "Continuing with default remote cwd.",
+                err=True,
+            )
+
+
 def _exec_via_session(
     ctx: Context,
     *,
@@ -192,6 +230,15 @@ def _exec_via_session(
             json_output=json_output,
         )
         return
+
+    # If we just started a new session, initialize its cwd to local $(pwd).
+    if started_new:
+        _maybe_init_session_cwd(
+            ctx=ctx,
+            client=client,
+            notebook_id=notebook_id,
+            json_output=json_output,
+        )
 
     try:
         if not json_output and not started_new:

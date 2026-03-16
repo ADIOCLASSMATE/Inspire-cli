@@ -33,6 +33,7 @@ from inspire.cli.utils.notebook_cli import (
     require_web_session,
     resolve_json_output,
 )
+from inspire.platform.web import session as web_session_module
 
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -54,6 +55,34 @@ def _build_init_command(*, cwd: str | None, env_vars: tuple[str, ...]) -> str:
 
     parts.append("pwd")
     return " && ".join(parts)
+
+
+def _try_fetch_notebook_name(
+    session: web_session_module.WebSession,
+    *,
+    base_url: str,
+    notebook_id: str,
+) -> str | None:
+    try:
+        data = web_session_module.request_json(
+            session,
+            "GET",
+            f"{base_url}/api/v1/notebook/{notebook_id}",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+    except Exception:
+        return None
+
+    if not isinstance(data, dict) or data.get("code") != 0:
+        return None
+
+    notebook = data.get("data")
+    if not isinstance(notebook, dict):
+        return None
+
+    name = str(notebook.get("name") or "").strip()
+    return name or None
 
 
 @click.group("exec-session")
@@ -219,18 +248,35 @@ def list_exec_sessions(ctx: Context, json_output: bool) -> None:
     sock_paths = sorted(glob.glob("/tmp/inspire-exec-sessions/*.sock"))
 
     sessions: list[dict] = []
+
+    # Lazy auth/session setup: only needed when we can enrich with names.
+    session = None
+    base_url = ""
+
     for sp in sock_paths:
         notebook_id = Path(sp).stem
         info = get_session_info(notebook_id)
         if not info:
             continue
-        sessions.append(
-            {
-                "notebook_id": info.notebook_id,
-                "pid": info.pid,
-                "socket": str(info.socket_path),
-            }
-        )
+
+        item: dict = {
+            "notebook_id": info.notebook_id,
+            "pid": info.pid,
+            "socket": str(info.socket_path),
+        }
+
+        # Default behavior: include notebook name when possible.
+        if json_output:
+            if session is None:
+                session = require_web_session(ctx, hint="Notebook exec-session requires web authentication.")
+                base_url = get_base_url()
+            item["name"] = _try_fetch_notebook_name(
+                session,
+                base_url=base_url,
+                notebook_id=info.notebook_id,
+            )
+
+        sessions.append(item)
 
     if json_output:
         click.echo(json_formatter.format_json({"sessions": sessions}))
