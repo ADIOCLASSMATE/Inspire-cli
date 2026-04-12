@@ -1,6 +1,6 @@
 # Inspire CLI
 
-Command-line interface for the Inspire HPC training platform.
+Command-line interface for the Inspire HPC training platform. Designed for both human and agent (Claude Code) use — all commands support `--json` for machine-readable output.
 
 ## Installation
 
@@ -60,10 +60,12 @@ inspire notebook exec <id> "<cmd>"  # Run a command non-interactively
 
 | Command | Description |
 |---------|-------------|
-| `inspire job create` | Submit a training job |
+| `inspire job create` | Submit a training job with explicit resource and location |
 | `inspire job status/logs/list` | Monitor and manage jobs |
 | `inspire job stop/wait` | Stop or wait for a job |
-| `inspire run "<cmd>"` | Quick job with auto resource selection |
+| `inspire run "<cmd>"` | Quick job submission (auto-selects location) |
+| `inspire resources allocate` | Show GPU availability & project budget overview |
+| `inspire resources list/nodes` | View GPU availability |
 | `inspire notebook list/create` | List or create notebook instances |
 | `inspire notebook start/stop` | Start or stop a notebook |
 | `inspire notebook terminal <id>` | Open an interactive terminal via Jupyter WebSocket |
@@ -72,10 +74,20 @@ inspire notebook exec <id> "<cmd>"  # Run a command non-interactively
 | `inspire image list/detail` | Browse Docker images |
 | `inspire image save/register` | Save or register custom images |
 | `inspire project list` | View projects and GPU quota |
-| `inspire resources list/nodes` | View GPU availability |
 | `inspire config show/check` | Inspect and validate configuration |
 | `inspire init` | Generate starter config from env vars |
 | `inspire init --discover` | Auto-discover projects, workspaces, compute groups |
+
+## Typical Agent Workflow
+
+When an agent (Claude Code) needs to submit a training job:
+
+1. **Check availability** — `inspire resources allocate --gpus 8 --type H200`
+2. **Submit with chosen location** — `inspire job create -n NAME -r 8xH200 -c "cmd" --location "H200-1号机房" --project PROJ --priority N`
+3. **Wait for completion** — `inspire job wait JOB_ID`
+4. **Fetch logs** — `inspire job logs JOB_ID --tail 50` or `inspire job logs JOB_ID --follow`
+
+Do NOT rely on `inspire run` for auto-location selection — its choice lacks strong evidence since per-node task priority data is unavailable. Always check `inspire resources allocate` first and specify `--location` explicitly.
 
 ## Examples
 
@@ -83,8 +95,9 @@ inspire notebook exec <id> "<cmd>"  # Run a command non-interactively
 # Open a realtime notebook terminal (recommended for debugging)
 inspire notebook terminal test-h100 --tmux train
 
-# Submit a training job
-inspire job create --name "train-v1" --resource "4xH200" --command "bash train.sh"
+# Submit a training job (check availability first!)
+inspire resources allocate --gpus 8 --type H200
+inspire job create --name "train-v1" --resource "8xH200" --command "bash train.sh" --location "H200-1号机房"
 
 # Quick run with auto-selected resources
 inspire run "python train.py --epochs 100"
@@ -93,7 +106,8 @@ inspire run "python train.py --epochs 100"
 inspire notebook exec dev-h200 "nvidia-smi"
 inspire notebook exec dev-h200 "python train.py" --timeout 3600
 
-# Check GPU availability and project quota
+# Check GPU availability and project budget
+inspire resources allocate --gpus 8 --type H200
 inspire resources list
 inspire project list
 

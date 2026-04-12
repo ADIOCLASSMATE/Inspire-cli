@@ -27,11 +27,15 @@
 - Fixed missing `prefer_source` and `project_order` defaults in `_default_config_values()`.
 - Unified GPU type handling — removed duplicate `GPUType` enum from `web/resources.py`, now imports from `openapi/models`.
 
+### Features
+
+- Added `inspire resources allocate` command — shows GPU availability and project budget overview for a resource request (`--gpus`, `--type`). Displays per-group free/preemptible/queued status and per-project budget. Read-only tool — does not create jobs. Always check this before submitting jobs with `inspire job create --location`.
+
 ### Migration Guide
 
 - For remote command execution, use `inspire notebook exec <notebook> "<cmd>"` or `inspire notebook terminal <notebook>`.
 - For persistent sessions, use `inspire notebook exec-session`.
-- For job submission, use `inspire job create` or `inspire run`.
+- For job submission, use `inspire job create` with `--location` (check `inspire resources allocate` first).
 - Remove any `[bridge]`, `[ssh]`, `[tunnel]`, `[git]`, `[gitea]`, `[github]`, or `[sync]` sections from your `config.toml`.
 - Remove `bridge_workflow` settings from `[gitea]` and `[github]` sections.
 - The `--sync` and `--watch` flags on `inspire run` no longer exist — just use `inspire run "command"`.

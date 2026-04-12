@@ -7,8 +7,12 @@ into smaller domain modules, and this file re-exports the public API to keep imp
 from __future__ import annotations
 
 from .availability import (
+    AllocateResult,
     FullFreeNodeCount,
     GPUAvailability,
+    GroupStatus,
+    ProjectBudget,
+    compute_allocate_overview,
     find_best_compute_group_accurate,
     get_accurate_gpu_availability,
     get_full_free_node_counts,
@@ -62,8 +66,12 @@ __all__ = [
     "list_job_users",
     "list_jobs",
     # Availability
+    "AllocateResult",
     "FullFreeNodeCount",
     "GPUAvailability",
+    "GroupStatus",
+    "ProjectBudget",
+    "compute_allocate_overview",
     "find_best_compute_group_accurate",
     "get_accurate_gpu_availability",
     "get_full_free_node_counts",
