@@ -209,7 +209,7 @@ def list_jobs(
         inspire job list --watch --interval 5
     """
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
 
         if watch:
             _watch_jobs(
@@ -260,7 +260,7 @@ def status(ctx: Context, job_id: str) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
         result = api.get_job_detail(job_id)
@@ -300,7 +300,7 @@ def stop(ctx: Context, job_id: str) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
         api.stop_training_job(job_id)
@@ -343,7 +343,7 @@ def wait(ctx: Context, job_id: str, timeout: int, interval: int) -> None:
     job_id = resolve_job_id(ctx, job_id)
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
@@ -470,7 +470,7 @@ def update_jobs(ctx: Context, status: tuple, limit: int, delay: float) -> None:
         statuses_set.update(alias_map.get(key, {s}))
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
         cache = job_deps.JobCache(config.get_expanded_cache_path())
 
@@ -548,7 +548,7 @@ def show_command(ctx: Context, job_id: str) -> None:
     source = None
 
     try:
-        config = Config.from_env()
+        config, _ = Config.from_files_and_env()
         api = AuthManager.get_api(config)
 
         result = api.get_job_detail(job_id)

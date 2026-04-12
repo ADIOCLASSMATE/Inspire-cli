@@ -174,7 +174,7 @@ def _exec_via_session(
     json_output: bool,
 ) -> None:
     """Execute command via persistent session (fast path)."""
-    from inspire.bridge.exec_session import (
+    from inspire.platform.web.exec_session import (
         SessionClient,
         get_session_info,
         start_session_server,
@@ -335,10 +335,10 @@ def _exec_via_playwright_sync(
         )
         return
 
-    from inspire.bridge.jupyter_exec import exec_in_jupyter_terminal
+    from inspire.platform.web.jupyter_exec import exec_in_jupyter_terminal
     from inspire.platform.web.browser_api.core import _launch_browser, _new_context
     from inspire.platform.web.browser_api.playwright_notebooks import open_notebook_lab
-    from inspire.platform.web.browser_api.rtunnel import (
+    from inspire.platform.web.browser_api.terminal_helpers import (
         _build_terminal_websocket_url,
         _create_terminal_via_api,
         _delete_terminal_via_api,

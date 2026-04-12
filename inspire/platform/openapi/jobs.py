@@ -30,6 +30,7 @@ def create_training_job_smart(
     project_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     image: Optional[str] = None,
+    image_type: Optional[str] = None,
     task_priority: Optional[int] = None,
     instance_count: Optional[int] = None,
     max_running_time_ms: Optional[str] = None,
@@ -61,11 +62,14 @@ def create_training_job_smart(
         shm_gi = api.DEFAULT_SHM_SIZE
 
     # Image configuration
-    final_image = image or api._get_default_image()
+    if not image:
+        raise ValueError("image is required (set --image or config [job].image)")
+    if not image_type:
+        raise ValueError("image_type is required (set --image-type or config [job].image_type)")
 
     framework_item = {
-        "image_type": api.DEFAULT_IMAGE_TYPE,
-        "image": final_image,
+        "image_type": image_type,
+        "image": image,
         "instance_count": instance_count,
         "spec_id": spec_id,
     }

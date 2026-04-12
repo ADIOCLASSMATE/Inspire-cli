@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from inspire.platform.openapi.jobs import create_training_job_smart
 
 
@@ -17,12 +19,10 @@ class _DummyAPI:
     DEFAULT_INSTANCE_COUNT = 1
     DEFAULT_MAX_RUNNING_TIME = "3600000"
     DEFAULT_SHM_SIZE = 128
-    DEFAULT_IMAGE_TYPE = "SOURCE_PRIVATE"
 
     def __init__(self) -> None:
         self.resource_manager = _DummyResourceManager()
         self.endpoints = SimpleNamespace(TRAIN_JOB_CREATE="/openapi/v1/train_job/create")
-        self.config = SimpleNamespace(docker_registry=None)
         self.last_request: tuple[str, str, dict] | None = None
 
     def _check_authentication(self) -> None:  # noqa: D401
@@ -32,9 +32,6 @@ class _DummyAPI:
         assert kwargs["name"]
         assert kwargs["command"]
         assert kwargs["resource"]
-
-    def _get_default_image(self) -> str:
-        return "registry.local/default:latest"
 
     def _make_request(self, method: str, endpoint: str, payload: dict) -> dict:
         self.last_request = (method, endpoint, payload)
@@ -49,6 +46,8 @@ def test_create_training_job_smart_builds_framework_config_payload() -> None:
         name="demo",
         command="echo demo",
         resource="1xH200",
+        image="registry.local/pytorch:latest",
+        image_type="SOURCE_PERSONAL_VISIBLE",
     )
 
     assert api.last_request is not None
@@ -62,8 +61,8 @@ def test_create_training_job_smart_builds_framework_config_payload() -> None:
     assert payload["workspace_id"] == "ws-default"
     assert payload["framework_config"] == [
         {
-            "image_type": "SOURCE_PRIVATE",
-            "image": "registry.local/default:latest",
+            "image_type": "SOURCE_PERSONAL_VISIBLE",
+            "image": "registry.local/pytorch:latest",
             "instance_count": 1,
             "spec_id": "spec-1x-h200",
             "shm_gi": 128,
@@ -76,6 +75,18 @@ def test_create_training_job_smart_builds_framework_config_payload() -> None:
     assert "shm_gi" not in payload
 
 
+def test_create_training_job_smart_requires_image() -> None:
+    api = _DummyAPI()
+
+    with pytest.raises(ValueError, match="image is required"):
+        create_training_job_smart(
+            api,
+            name="demo",
+            command="echo demo",
+            resource="1xH200",
+        )
+
+
 def test_create_training_job_smart_uses_overrides_for_framework_config() -> None:
     api = _DummyAPI()
 
@@ -85,6 +96,7 @@ def test_create_training_job_smart_uses_overrides_for_framework_config() -> None
         command="echo demo",
         resource="1xH200",
         image="custom.registry/pytorch:tag",
+        image_type="SOURCE_PUBLIC",
         instance_count=2,
         shm_gi=256,
     )
@@ -93,5 +105,6 @@ def test_create_training_job_smart_uses_overrides_for_framework_config() -> None
     payload = api.last_request[2]
     framework_item = payload["framework_config"][0]
     assert framework_item["image"] == "custom.registry/pytorch:tag"
+    assert framework_item["image_type"] == "SOURCE_PUBLIC"
     assert framework_item["instance_count"] == 2
     assert framework_item["shm_gi"] == 256

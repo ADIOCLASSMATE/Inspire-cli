@@ -127,7 +127,7 @@ def list_images_cmd(
     \b
     Examples:
         inspire image list                              # Official images
-        inspire image list --source private             # Your custom images
+        inspire image list --source personal-visible    # Your custom images
         inspire image list --source personal-visible    # Web UI "personal visible" tab
         inspire image list --source all                 # All sources
         inspire image list --source all --json          # JSON output
@@ -147,7 +147,7 @@ def list_images_cmd(
 
     try:
         if source == "all":
-            for src_key in ("official", "public", "private"):
+            for src_key in ("official", "public", "personal-visible"):
                 items = browser_api_module.list_images_by_source(source=src_key, session=session)
                 results.extend(_image_to_dict(img) for img in items)
         else:

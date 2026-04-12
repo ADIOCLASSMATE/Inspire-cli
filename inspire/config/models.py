@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
 
 # Config file paths
 CONFIG_FILENAME = "config.toml"
@@ -86,6 +85,7 @@ class Config:
     # Job settings
     job_priority: int = 6
     job_image: Optional[str] = None
+    job_image_type: str = "SOURCE_PERSONAL_VISIBLE"
     job_project_id: Optional[str] = None
     job_workspace_id: Optional[str] = None
 
@@ -119,18 +119,6 @@ class Config:
     notebook_resource: str = "1xH200"
     notebook_image: Optional[str] = None
     notebook_post_start: Optional[str] = None
-
-    # SSH settings
-    rtunnel_bin: Optional[str] = None
-    sshd_deb_dir: Optional[str] = None
-    dropbear_deb_dir: Optional[str] = None
-    setup_script: Optional[str] = None
-    rtunnel_download_url: str = field(default_factory=default_rtunnel_download_url)
-    apt_mirror_url: Optional[str] = None
-
-    # Tunnel retry settings
-    tunnel_retries: int = 3
-    tunnel_retry_pause: float = 2.0
 
     # Other
     shm_size: Optional[int] = None

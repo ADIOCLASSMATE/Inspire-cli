@@ -76,13 +76,13 @@ def _open_terminal_via_playwright(
 
     from inspire.platform.web.browser_api.core import _launch_browser, _new_context
     from inspire.platform.web.browser_api.playwright_notebooks import open_notebook_lab
-    from inspire.platform.web.browser_api.rtunnel import (
+    from inspire.platform.web.browser_api.terminal_helpers import (
         _build_jupyter_xsrf_headers,
         _build_terminal_websocket_url,
         _create_terminal_via_api,
         _delete_terminal_via_api,
     )
-    from inspire.bridge.jupyter_terminal import JupyterTerminalProxy
+    from inspire.platform.web.jupyter_terminal import JupyterTerminalProxy
 
     with sync_playwright() as p:
         browser = _launch_browser(p, headless=True)

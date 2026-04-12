@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from inspire.config.models import SOURCE_DEFAULT
-from inspire.config.rtunnel_defaults import default_rtunnel_download_url
 
 _ACCOUNT_OVERRIDE_FIELDS = {
     "base_url",
@@ -20,11 +19,6 @@ _ACCOUNT_OVERRIDE_FIELDS = {
     "browser_api_prefix",
     "auth_endpoint",
     "docker_registry",
-    "rtunnel_bin",
-    "sshd_deb_dir",
-    "dropbear_deb_dir",
-    "setup_script",
-    "rtunnel_download_url",
 }
 
 _ACCOUNT_SECTION_KEY_MAP = {
@@ -40,17 +34,11 @@ _ACCOUNT_SECTION_KEY_MAP = {
         "auth_endpoint": "auth_endpoint",
         "docker_registry": "docker_registry",
     },
-    "ssh": {
-        "rtunnel_bin": "rtunnel_bin",
-        "sshd_deb_dir": "sshd_deb_dir",
-        "dropbear_deb_dir": "dropbear_deb_dir",
-        "setup_script": "setup_script",
-        "rtunnel_download_url": "rtunnel_download_url",
-    },
 }
 
 _DEFAULTS_FIELD_MAP = {
     "image": "job_image",
+    "image_type": "job_image_type",
     "notebook_image": "notebook_image",
     "notebook_resource": "notebook_resource",
     "notebook_post_start": "notebook_post_start",
@@ -117,6 +105,7 @@ def _default_config_values() -> dict[str, Any]:
         "docker_registry": None,
         "job_priority": 6,
         "job_image": None,
+        "job_image_type": "SOURCE_PERSONAL_VISIBLE",
         "job_project_id": None,
         "job_workspace_id": None,
         "workspace_cpu_id": None,
@@ -133,14 +122,6 @@ def _default_config_values() -> dict[str, Any]:
         "notebook_resource": "1xH200",
         "notebook_image": None,
         "notebook_post_start": None,
-        "rtunnel_bin": None,
-        "sshd_deb_dir": None,
-        "dropbear_deb_dir": None,
-        "setup_script": None,
-        "rtunnel_download_url": default_rtunnel_download_url(),
-        "apt_mirror_url": None,
-        "tunnel_retries": 3,
-        "tunnel_retry_pause": 2.0,
         "shm_size": None,
         "compute_groups": [],
         "remote_env": {},
@@ -258,6 +239,7 @@ def _coerce_project_default(field_name: str, raw_value: Any) -> Any:
     if field_name in {
         "target_dir",
         "job_image",
+        "job_image_type",
         "notebook_image",
         "notebook_resource",
         "notebook_post_start",

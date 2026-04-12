@@ -1282,7 +1282,6 @@ class TestInitCommand:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
     ) -> None:
         from inspire.platform.web.browser_api.projects import ProjectInfo
-        import inspire.config.ssh_runtime as ssh_runtime_module
         import inspire.platform.web.browser_api as browser_api_module
         from inspire.cli.commands.init import discover as discover_module
 
@@ -1331,11 +1330,6 @@ class TestInitCommand:
         monkeypatch.setattr(browser_api_module, "list_notebook_compute_groups", lambda **_: [])
         monkeypatch.setattr(browser_api_module, "get_notebook_schedule", lambda **_: {})
         monkeypatch.setattr(browser_api_module, "list_images", lambda **_: [])
-        monkeypatch.setattr(
-            ssh_runtime_module,
-            "resolve_ssh_runtime_config",
-            lambda: SimpleNamespace(),
-        )
 
         probe_calls: list[dict] = []
 
@@ -1386,7 +1380,6 @@ class TestInitCommand:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_env: None
     ) -> None:
         from inspire.platform.web.browser_api.projects import ProjectInfo
-        import inspire.config.ssh_runtime as ssh_runtime_module
         import inspire.platform.web.browser_api as browser_api_module
         from inspire.cli.commands.init import discover as discover_module
 
@@ -1430,11 +1423,6 @@ class TestInitCommand:
         monkeypatch.setattr(browser_api_module, "list_notebook_compute_groups", lambda **_: [])
         monkeypatch.setattr(browser_api_module, "get_notebook_schedule", lambda **_: {})
         monkeypatch.setattr(browser_api_module, "list_images", lambda **_: [])
-        monkeypatch.setattr(
-            ssh_runtime_module,
-            "resolve_ssh_runtime_config",
-            lambda: SimpleNamespace(),
-        )
 
         def fake_probe(**kwargs):
             if kwargs["project_alias"] == "alpha":

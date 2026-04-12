@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .jupyter_terminal import (
+from inspire.platform.web.jupyter_terminal import (
     _WS_CLOSED_JS,
     _WS_CLOSE_JS,
     _WS_READ_JS,

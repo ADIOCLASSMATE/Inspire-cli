@@ -19,7 +19,7 @@ from inspire.config.schema_models import (  # noqa: F401
 )
 from inspire.config.options.api import API_OPTIONS, AUTH_OPTIONS
 from inspire.config.options.forge import GITEA_OPTIONS, GITHUB_OPTIONS, GIT_PLATFORM_OPTIONS
-from inspire.config.options.infra import SSH_OPTIONS, TUNNEL_OPTIONS, BRIDGE_OPTIONS, PATHS_OPTIONS
+from inspire.config.options.infra import PATHS_OPTIONS
 from inspire.config.options.project import (
     JOB_OPTIONS,
     NOTEBOOK_OPTIONS,
@@ -36,12 +36,9 @@ CONFIG_OPTIONS: list[ConfigOption] = [
     *GITEA_OPTIONS,
     *GITHUB_OPTIONS,
     *SYNC_OPTIONS,
-    *BRIDGE_OPTIONS,
     *WORKSPACES_OPTIONS,
     *JOB_OPTIONS,
     *NOTEBOOK_OPTIONS,
-    *SSH_OPTIONS,
-    *TUNNEL_OPTIONS,
 ]
 
 

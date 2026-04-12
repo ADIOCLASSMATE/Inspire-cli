@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-_log = logging.getLogger("inspire.bridge.exec_session")
+_log = logging.getLogger("inspire.platform.web.exec_session")
 
 # Session idle timeout in seconds (15 minutes).
 _IDLE_TIMEOUT = 900
@@ -297,7 +297,7 @@ class SessionServer:
 
             from inspire.platform.web.browser_api.core import _launch_browser, _new_context
             from inspire.platform.web.browser_api.playwright_notebooks import open_notebook_lab
-            from inspire.platform.web.browser_api.rtunnel import (
+            from inspire.platform.web.browser_api.terminal_helpers import (
                 _build_terminal_websocket_url,
                 _create_terminal_via_api,
             )
@@ -373,8 +373,8 @@ class SessionServer:
         """
         import re
 
-        from inspire.bridge.jupyter_exec import _ANSI_RE, _EXIT_RE, _EXIT_SENTINEL, _POLL_INTERVAL
-        from inspire.bridge.jupyter_terminal import (
+        from inspire.platform.web.jupyter_exec import _ANSI_RE, _EXIT_RE, _EXIT_SENTINEL, _POLL_INTERVAL
+        from inspire.platform.web.jupyter_terminal import (
             _WS_CLOSE_JS,
             _WS_CLOSED_JS,
             _WS_READ_JS,
@@ -497,7 +497,7 @@ class SessionServer:
     def _teardown(self) -> None:
         if self._term_name and self._lab_url and self._context:
             try:
-                from inspire.platform.web.browser_api.rtunnel import _delete_terminal_via_api
+                from inspire.platform.web.browser_api.terminal_helpers import _delete_terminal_via_api
                 _delete_terminal_via_api(self._context, lab_url=self._lab_url, term_name=self._term_name)
             except Exception:
                 pass
@@ -549,7 +549,7 @@ def start_session_server(notebook_id: str, session) -> int:
     code = (
         "import json, logging, sys; "
         "logging.basicConfig(level=logging.DEBUG, stream=sys.stderr); "
-        "from inspire.bridge.exec_session import SessionServer; "
+        "from inspire.platform.web.exec_session import SessionServer; "
         f"ss = json.load(open({state_path!r})); "
         f"s = SessionServer({notebook_id!r}, ss); "
         "s.run()"

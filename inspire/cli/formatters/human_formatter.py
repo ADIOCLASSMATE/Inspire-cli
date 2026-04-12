@@ -280,6 +280,7 @@ def format_image_list(images: List[Dict[str, Any]]) -> str:
         "SOURCE_OFFICIAL": "official",
         "SOURCE_PUBLIC": "public",
         "SOURCE_PRIVATE": "private",
+        "SOURCE_PERSONAL_VISIBLE": "personal",
     }
 
     lines = [
@@ -350,6 +351,7 @@ def format_image_detail(image_data: Dict[str, Any]) -> str:
         "SOURCE_OFFICIAL": "official",
         "SOURCE_PUBLIC": "public",
         "SOURCE_PRIVATE": "private",
+        "SOURCE_PERSONAL_VISIBLE": "personal",
     }
 
     raw_source = str(image_data.get("source", ""))

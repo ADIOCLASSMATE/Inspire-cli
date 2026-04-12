@@ -154,7 +154,7 @@ def _send_command_via_terminal_ws(
     timeout_ms: int,
     completion_marker: str | None = None,
 ) -> bool:
-    from inspire.platform.web.browser_api.rtunnel import (
+    from inspire.platform.web.browser_api.terminal_helpers import (
         _build_terminal_websocket_url,
         _create_terminal_via_api,
         _delete_terminal_via_api,
@@ -220,7 +220,7 @@ def _run_command_in_notebook_sync(
 
     from playwright.sync_api import sync_playwright
 
-    from inspire.platform.web.browser_api.rtunnel import (
+    from inspire.platform.web.browser_api.terminal_helpers import (
         _focus_terminal_input,
         _open_or_create_terminal,
     )

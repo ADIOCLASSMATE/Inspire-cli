@@ -12,6 +12,18 @@ from .models import SessionExpiredError, WebSession
 from .proxy import get_playwright_proxy
 
 
+def _suppress_greenlet_switch_error(loop, context):
+    """Custom asyncio exception handler that suppresses the known Playwright
+    greenlet cleanup error after ``sync_playwright().stop()``."""
+    exception = context.get("exception")
+    msg = context.get("message", "")
+    # Suppress the harmless greenlet callback error after playwright.stop()
+    if exception and "'NoneType' object has no attribute 'switch'" in str(exception):
+        return
+    # For everything else, use the default handler
+    loop.default_exception_handler(context)
+
+
 class _BrowserRequestClient:
     def __init__(self, session: WebSession) -> None:
         from playwright.sync_api import sync_playwright
@@ -84,6 +96,18 @@ class _BrowserRequestClient:
             pass
         try:
             self._playwright.stop()
+        except Exception:
+            pass
+
+        # Suppress the known Playwright greenlet cleanup error that fires
+        # after stop(): "AttributeError: 'NoneType' object has no attribute 'switch'"
+        # This happens because the asyncio loop still has pending callbacks
+        # referencing the now-stopped greenlet.
+        try:
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            loop.set_exception_handler(_suppress_greenlet_switch_error)
         except Exception:
             pass
 

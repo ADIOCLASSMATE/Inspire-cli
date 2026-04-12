@@ -102,9 +102,9 @@ class NotebookIdleProbe:
         if self._page is None or self._context is None:
             return False
 
-        from inspire.bridge.jupyter_exec import exec_in_jupyter_terminal
+        from inspire.platform.web.jupyter_exec import exec_in_jupyter_terminal
         from inspire.platform.web.browser_api.playwright_notebooks import open_notebook_lab
-        from inspire.platform.web.browser_api.rtunnel import (
+        from inspire.platform.web.browser_api.terminal_helpers import (
             _build_terminal_websocket_url,
             _create_terminal_via_api,
             _delete_terminal_via_api,

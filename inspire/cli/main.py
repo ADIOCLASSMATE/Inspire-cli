@@ -24,8 +24,6 @@ from inspire.cli.commands import (
     resources,
     config,
     sync,
-    bridge,
-    tunnel,
     run,
     notebook,
     init,
@@ -90,13 +88,26 @@ main.add_command(job)
 main.add_command(resources)
 main.add_command(config)
 main.add_command(sync)
-main.add_command(bridge)
-main.add_command(tunnel)
 main.add_command(run)
 main.add_command(notebook)
 main.add_command(init)
 main.add_command(image)
 main.add_command(project)
+
+
+def _suppress_playwright_greenlet_error(loop, context):
+    """Suppress the harmless greenlet cleanup error after Playwright stop().
+
+    Playwright's sync API leaves a pending asyncio callback that fires
+    after ``sync_playwright().stop()`` tries to switch back to a greenlet
+    that has already been cleaned up, producing:
+        AttributeError: 'NoneType' object has no attribute 'switch'
+    This is harmless noise — suppress it so CLI output stays clean.
+    """
+    exception = context.get("exception")
+    if exception and "'NoneType' object has no attribute 'switch'" in str(exception):
+        return
+    loop.default_exception_handler(context)
 
 
 def cli() -> None:
@@ -107,6 +118,16 @@ def cli() -> None:
         logging.getLogger(__name__).exception("Unhandled exception in inspire CLI")
         click.echo(f"Error: {e}", err=True)
         sys.exit(EXIT_GENERAL_ERROR)
+    finally:
+        # Install a suppressor for the known Playwright greenlet cleanup
+        # error that fires after sync_playwright().stop().
+        try:
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            loop.set_exception_handler(_suppress_playwright_greenlet_error)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":  # pragma: no cover

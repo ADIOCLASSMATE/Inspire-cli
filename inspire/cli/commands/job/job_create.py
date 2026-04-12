@@ -37,6 +37,7 @@ def run_job_create(
     workspace_id_override: str | None,
     auto: bool,
     image: str | None,
+    image_type: str | None,
     log_file: str | None,
     project: str | None,
     nodes: int,
@@ -50,6 +51,18 @@ def run_job_create(
             priority = config.job_priority
         if image is None:
             image = config.job_image
+        if image_type is None:
+            image_type = config.job_image_type
+
+        if not image:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                "No default image configured. Set [job].image in config.toml "
+                "or pass --image on the command line.",
+                EXIT_CONFIG_ERROR,
+            )
+            return
 
         try:
             requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(
@@ -164,6 +177,7 @@ def run_job_create(
                 project_id=selected_project_id,
                 workspace_id=selected_workspace_id,
                 image=image,
+                image_type=image_type,
                 priority=priority,
                 nodes=nodes,
                 max_time_hours=max_time,
@@ -252,6 +266,12 @@ def run_job_create(
     help="Custom Docker image (default from config [job].image)",
 )
 @click.option(
+    "--image-type",
+    "image_type",
+    default=None,
+    help="Image source type: SOURCE_OFFICIAL, SOURCE_PUBLIC, or SOURCE_PERSONAL_VISIBLE (default: SOURCE_PERSONAL_VISIBLE)",
+)
+@click.option(
     "--log-file",
     default=None,
     help=(
@@ -285,6 +305,7 @@ def create(
     workspace_id_override: Optional[str],
     auto: bool,
     image: Optional[str],
+    image_type: Optional[str],
     log_file: Optional[str],
     project: Optional[str],
     nodes: int,
@@ -328,6 +349,7 @@ def create(
         workspace_id_override=workspace_id_override,
         auto=auto,
         image=image,
+        image_type=image_type,
         log_file=log_file,
         project=project,
         nodes=nodes,

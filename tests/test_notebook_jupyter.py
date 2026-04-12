@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from types import ModuleType, SimpleNamespace
 
-from inspire.platform.web.browser_api import rtunnel as rtunnel_module
+from inspire.platform.web.browser_api import terminal_helpers as rtunnel_module
 from inspire.platform.web.browser_api import playwright_notebooks as notebooks_module
 from inspire.platform.web.browser_api.playwright_notebooks import build_jupyter_proxy_url
 

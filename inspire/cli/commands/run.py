@@ -194,6 +194,7 @@ def _run_flow(
     workspace_id_override: str | None,
     max_time: float,
     image: str | None,
+    image_type: str | None,
     nodes: int,
     project: str | None,
     log_file: str | None,
@@ -208,6 +209,18 @@ def _run_flow(
             priority = config.job_priority
         if image is None:
             image = config.job_image
+        if image_type is None:
+            image_type = config.job_image_type
+
+        if not image:
+            _handle_error(
+                ctx,
+                "ConfigError",
+                "No default image configured. Set [job].image in config.toml "
+                "or pass --image on the command line.",
+                EXIT_CONFIG_ERROR,
+            )
+            return
 
         selected_workspace_id = select_workspace_id(
             config,
@@ -276,6 +289,7 @@ def _run_flow(
                 project_id=project_id,
                 workspace_id=selected_workspace_id,
                 image=image,
+                image_type=image_type,
                 priority=priority,
                 nodes=nodes,
                 max_time_hours=max_time,
@@ -386,7 +400,13 @@ def _run_flow(
     help="Custom Docker image (default from config [job].image)",
 )
 @click.option(
-    "--nodes", type=int, default=1, help="Number of nodes for multi-node training (default: 1)"
+    "--image-type",
+    "image_type",
+    default=None,
+    help="Image source type: SOURCE_OFFICIAL, SOURCE_PUBLIC, or SOURCE_PERSONAL_VISIBLE (default: SOURCE_PERSONAL_VISIBLE)",
+)
+@click.option(
+    "--nodes", type=int, default=1, help="Number for multi-node training (default: 1)"
 )
 @click.option(
     "--log-file",
@@ -413,6 +433,7 @@ def run(
     workspace_id_override: str | None,
     max_time: float,
     image: str | None,
+    image_type: str | None,
     nodes: int,
     log_file: str | None,
 ) -> None:
@@ -457,6 +478,7 @@ def run(
         workspace_id_override=workspace_id_override,
         max_time=max_time,
         image=image,
+        image_type=image_type,
         nodes=nodes,
         log_file=log_file,
     )

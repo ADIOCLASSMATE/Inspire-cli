@@ -1,7 +1,7 @@
 """Notebook exec-session subcommands.
 
 These commands manage the local persistent exec session daemon implemented in
-`inspire.bridge.exec_session`.
+`inspire.platform.web.exec_session`.
 
 They are intentionally separate from `inspire notebook exec --session` so users
 can start/stop/list sessions explicitly.
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import click
 
-from inspire.bridge.exec_session import (
+from inspire.platform.web.exec_session import (
     SessionClient,
     get_session_info,
     start_session_server,

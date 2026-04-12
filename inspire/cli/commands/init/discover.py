@@ -397,149 +397,14 @@ def _probe_project_shared_path_group(
     keep_notebook: bool,
     timeout: int,
 ) -> dict[str, Any]:
-    from inspire.bridge.tunnel.models import BridgeProfile, TunnelConfig
-    from inspire.bridge.tunnel.ssh_exec import run_ssh_command
-
-    result: dict[str, Any] = {
+    # SSH/tunnel probe has been removed. Return a result indicating the feature
+    # is unavailable so the rest of the discover flow continues gracefully.
+    return {
         "notebook_id": None,
         "shared_path_group": None,
         "probe_data": None,
-        "probe_error": None,
+        "probe_error": "SSH probe has been removed; shared-path discovery is no longer available.",
     }
-
-    timeout = max(60, int(timeout))
-
-    notebook_id: str | None = None
-    try:
-        name = f"insp-probe-{project_alias}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        resource_spec_price = {
-            "cpu_type": "",
-            "cpu_count": int(cpu_count),
-            "gpu_type": "",
-            "gpu_count": 0,
-            "memory_size_gib": int(memory_size),
-            "logic_compute_group_id": logic_compute_group_id,
-            "quota_id": quota_id,
-        }
-
-        created = browser_api_module.create_notebook(
-            name=name,
-            project_id=project_id,
-            project_name=project_name,
-            image_id=image_id,
-            image_url=image_url,
-            logic_compute_group_id=logic_compute_group_id,
-            quota_id=quota_id,
-            gpu_type="",
-            gpu_count=0,
-            cpu_count=int(cpu_count),
-            memory_size=int(memory_size),
-            shared_memory_size=int(shm_size),
-            auto_stop=True,
-            workspace_id=workspace_id,
-            session=session,
-            task_priority=int(task_priority),
-            resource_spec_price=resource_spec_price,
-        )
-        notebook_id = str((created or {}).get("notebook_id") or "").strip() or None
-        result["notebook_id"] = notebook_id
-        if not notebook_id:
-            result["probe_error"] = "Notebook create succeeded but did not return notebook_id"
-            return result
-
-        browser_api_module.wait_for_notebook_running(
-            notebook_id=notebook_id,
-            session=session,
-            timeout=timeout,
-        )
-
-        proxy_url = browser_api_module.setup_notebook_rtunnel(
-            notebook_id=notebook_id,
-            ssh_public_key=ssh_public_key,
-            ssh_runtime=ssh_runtime,
-            session=session,
-            headless=True,
-            timeout=min(timeout, 600),
-        )
-
-        bridge = BridgeProfile(
-            name="probe",
-            proxy_url=proxy_url,
-            ssh_user="root",
-            ssh_port=22222,
-            has_internet=True,
-        )
-        tunnel_config = TunnelConfig(bridges={"probe": bridge}, default_bridge="probe")
-
-        command = _build_shared_path_probe_command(account_key=account_key)
-
-        last_error: str | None = None
-        completed = None
-        deadline = time.monotonic() + timeout
-        attempt = 0
-        while time.monotonic() < deadline:
-            attempt += 1
-            remaining = max(0.0, deadline - time.monotonic())
-            per_attempt_timeout = max(10, min(60, int(remaining) if remaining else 10))
-
-            try:
-                completed = run_ssh_command(
-                    command,
-                    config=tunnel_config,
-                    timeout=per_attempt_timeout,
-                    capture_output=True,
-                    check=False,
-                    quiet_proxy=True,
-                )
-                if completed.returncode == 0:
-                    break
-                last_error = (completed.stderr or "").strip() or (completed.stdout or "").strip()
-            except Exception as e:
-                last_error = _redact_token_like_text(str(e))
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            pause = min(20.0, 2.0 + (attempt * 1.5))
-            time.sleep(min(pause, remaining))
-
-        if completed is None or completed.returncode != 0:
-            summary = (last_error or "SSH probe failed").strip()
-            result["probe_error"] = _redact_token_like_text(summary)[:2000]
-            return result
-
-        stdout = completed.stdout or ""
-        probe_data = None
-        for line in reversed([ln.strip() for ln in stdout.splitlines() if ln.strip()]):
-            if not (line.startswith("{") and line.endswith("}")):
-                continue
-            try:
-                probe_data = json.loads(line)
-                break
-            except Exception:
-                continue
-
-        result["probe_data"] = probe_data
-        if isinstance(probe_data, dict):
-            global_user_dir = str(probe_data.get("global_user_dir") or "").strip()
-            if global_user_dir:
-                result["shared_path_group"] = global_user_dir
-        return result
-    except NotebookFailedError as e:
-        result["probe_error"] = f"Notebook failed: {e.status}"
-        if e.events:
-            result["probe_error"] += f" - {e.events}"
-        return result
-    except Exception as e:  # pragma: no cover - network/runtime dependent
-        result["probe_error"] = _redact_token_like_text(str(e))
-        return result
-    finally:
-        if notebook_id and not keep_notebook:
-            try:
-                browser_api_module.stop_notebook(notebook_id=notebook_id, session=session)
-            except Exception:
-                pass
 
 
 def _discover_workspace_aliases() -> dict[str, str]:
@@ -1537,19 +1402,8 @@ def _resolve_probe_defaults(
     session,  # noqa: ANN001
     probe_pubkey: str | None,
 ) -> _ProbeDefaults:
-    try:
-        ssh_public_key = _load_ssh_public_key(probe_pubkey)
-    except ValueError as e:
-        click.echo(click.style(str(e), fg="red"))
-        raise SystemExit(1) from e
-
-    try:
-        from inspire.config.ssh_runtime import resolve_ssh_runtime_config
-
-        ssh_runtime = resolve_ssh_runtime_config()
-    except Exception as e:
-        click.echo(click.style(f"Failed to resolve SSH runtime config: {e}", fg="red"))
-        raise SystemExit(1) from e
+    ssh_public_key = ""
+    ssh_runtime = None
 
     probe_workspace_id = str(
         getattr(config, "workspace_cpu_id", "") or merged_workspaces.get("cpu") or workspace_id

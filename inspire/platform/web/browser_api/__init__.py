@@ -46,7 +46,6 @@ from .images import (
     save_notebook_as_image,
     wait_for_image_ready,
 )
-from .rtunnel import setup_notebook_rtunnel
 from .projects import (
     ProjectInfo,
     check_scheduling_health,
@@ -93,7 +92,6 @@ __all__ = [
     "list_images",
     "list_notebook_compute_groups",
     "run_command_in_notebook",
-    "setup_notebook_rtunnel",
     "start_notebook",
     "stop_notebook",
     "wait_for_notebook_running",
