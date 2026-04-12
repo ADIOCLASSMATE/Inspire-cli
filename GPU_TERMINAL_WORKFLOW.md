@@ -1,6 +1,6 @@
 # Realtime GPU Terminal Workflow for Inspire CLI
 
-This document describes the new recommended workflow for getting an SSH-like realtime terminal on Inspire GPU notebooks from the CPU machine, with live output and interactive debugging.
+This document describes the recommended workflow for getting a realtime terminal on Inspire GPU notebooks from the CPU machine, with live output and interactive debugging.
 
 ## Executive summary
 
@@ -10,15 +10,7 @@ Use:
 inspire notebook terminal <notebook> --tmux train
 ```
 
-Do **not** rely on:
-
-```bash
-inspire notebook ssh ...
-```
-
-on this platform for daily work, because the rtunnel/SSH path proved unreliable.
-
-The new `inspire notebook terminal` command talks directly to the notebook's **Jupyter terminal WebSocket**, which gives you:
+The `inspire notebook terminal` command connects directly to the notebook's **Jupyter terminal WebSocket**, which gives you:
 
 - realtime terminal output
 - interactive shell input
@@ -64,7 +56,7 @@ Ctrl+]
 
 Added:
 
-- `inspire/bridge/jupyter_terminal.py`
+- `inspire/platform/web/jupyter_terminal.py`
 - `inspire/cli/commands/notebook/notebook_terminal_flow.py`
 
 Updated:
@@ -76,27 +68,9 @@ Updated:
 
 ---
 
-## Why this is better than SSH here
+## Why the WebSocket terminal path
 
-We tested `inspire notebook ssh` on both 4090 and H100.
-
-### Result
-It failed at rtunnel proxy readiness with errors like:
-
-```text
-500 connect ECONNREFUSED 0.0.0.0:31337
-```
-
-So although SSH was conceptually appealing, it was not reliable enough for your actual workflow.
-
-The WebSocket terminal route is simpler:
-
-- no rtunnel
-- no SSH daemon requirement
-- no proxying a local TCP port
-- no dependence on notebook-side SSH bootstrap
-
-Instead it uses the notebook's existing Jupyter terminal support directly.
+The WebSocket terminal route uses the notebook's existing Jupyter terminal support directly — no SSH daemon, no port proxying, no extra bootstrap required.
 
 ---
 
@@ -280,7 +254,7 @@ Best for:
 Use:
 
 ```bash
-inspire run "cd /path && python -u train.py" --sync --watch
+inspire run "cd /path && python -u train.py"
 ```
 
 Best for:
@@ -290,7 +264,7 @@ Best for:
 
 Recommended pattern:
 1. Debug in notebook terminal
-2. Once stable, switch to `inspire run --sync --watch`
+2. Once stable, switch to `inspire run`
 
 ---
 
@@ -429,7 +403,7 @@ A global Claude skill was added at:
 /root/.claude/skills/gpu-terminal.md
 ```
 
-This skill tells Claude to prefer the new terminal workflow over SSH for Inspire GPU notebook interaction.
+This skill tells Claude to prefer the terminal workflow for Inspire GPU notebook interaction.
 
 ---
 
@@ -438,6 +412,6 @@ This skill tells Claude to prefer the new terminal workflow over SSH for Inspire
 For your platform, the right answer is:
 
 - **interactive debugging / realtime training output** → `inspire notebook terminal --tmux ...`
-- **formal long training after code stabilizes** → `inspire run --sync --watch ...`
+- **formal long training after code stabilizes** → `inspire run ...`
 
-This gives you the practical benefits you wanted from SSH, without depending on the unreliable rtunnel SSH path.
+This gives you practical interactive debugging and realtime output directly over WebSocket — simple, reliable, and no extra infrastructure required.

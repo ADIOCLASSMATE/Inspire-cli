@@ -1,8 +1,7 @@
 """Jupyter terminal API helpers.
 
-Functions for creating, deleting, and connecting to JupyterLab terminals
-via REST API, WebSocket, and DOM manipulation.  Extracted from the old
-rtunnel module; these are pure Jupyter operations with no SSH/tunnel dependency.
+Pure Jupyter operations for creating, deleting, and connecting to terminals
+via REST API and WebSocket.
 """
 
 from __future__ import annotations

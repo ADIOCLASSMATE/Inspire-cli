@@ -3,13 +3,10 @@
 Usage:
     inspire run "python train.py"
     inspire run "bash train.sh" --gpus 4 --type H100
-    inspire run "python train.py" --sync --watch
 """
 
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import sys
 import time
@@ -46,67 +43,6 @@ def _get_current_branch() -> str | None:
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-
-
-def _check_uncommitted_changes() -> bool:
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return bool(result.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-def _get_inspire_executable() -> str | None:
-    return shutil.which("inspire")
-
-
-def _run_inspire_subcommand(args: list[str]) -> int:
-    exe = _get_inspire_executable()
-    if not exe:
-        raise RuntimeError("Cannot find 'inspire' executable in PATH")
-    proc = subprocess.run([exe, *args])
-    return proc.returncode
-
-
-def _exec_inspire_subcommand(args: list[str]) -> None:
-    exe = _get_inspire_executable()
-    if not exe:
-        raise RuntimeError("Cannot find 'inspire' executable in PATH")
-    os.execv(exe, [exe, *args])
-
-
-def _run_sync_if_requested(ctx: Context, *, sync: bool, watch: bool, no_sync: bool) -> None:
-    if no_sync:
-        return
-
-    if not (sync or watch):
-        return
-
-    if ctx.debug and not ctx.json_output:
-        click.echo("Syncing code...")
-
-    if _check_uncommitted_changes():
-        _handle_error(
-            ctx,
-            "ValidationError",
-            "Uncommitted changes detected. Commit or stash first.",
-            EXIT_GENERAL_ERROR,
-        )
-
-    try:
-        exit_code = _run_inspire_subcommand(["sync"])
-    except Exception as e:
-        _handle_error(ctx, "SyncError", f"Failed to run sync: {e}", EXIT_GENERAL_ERROR)
-
-    if exit_code != EXIT_SUCCESS:
-        _handle_error(ctx, "SyncError", "Code sync failed", EXIT_GENERAL_ERROR)
-
-    time.sleep(0.5)
 
 
 def _resolve_run_resource_and_location(
@@ -185,9 +121,6 @@ def _run_flow(
     gpus: int,
     gpu_type: str,
     name: str | None,
-    sync: bool,
-    watch: bool,
-    no_sync: bool,
     priority: int | None,
     location: str | None,
     workspace: str | None,
@@ -199,8 +132,6 @@ def _run_flow(
     project: str | None,
     log_file: str | None,
 ) -> None:
-    _run_sync_if_requested(ctx, sync=sync, watch=watch, no_sync=no_sync)
-
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True)
         api = AuthManager.get_api(config)
@@ -337,19 +268,6 @@ def _run_flow(
                 )
                 click.echo(f"Check status with: inspire job status {job_id}")
 
-        if watch:
-            if ctx.json_output:
-                sys.exit(EXIT_SUCCESS)
-
-            if ctx.debug:
-                click.echo("Following logs...")
-            try:
-                _exec_inspire_subcommand(["job", "logs", job_id, "--follow"])
-            except Exception as e:
-                click.echo(f"Failed to start log follow: {e}", err=True)
-                click.echo(f"You can still run: inspire job logs {job_id} --follow")
-                sys.exit(EXIT_GENERAL_ERROR)
-
         sys.exit(EXIT_SUCCESS)
 
     except ConfigError as e:
@@ -371,9 +289,6 @@ def _run_flow(
     help="GPU type (default: H200)",
 )
 @click.option("--name", "-n", help="Job name (auto-generated if not specified)")
-@click.option("--sync", "-s", is_flag=True, help="Sync code before running")
-@click.option("--no-sync", is_flag=True, help="Do not sync code (even with --watch)")
-@click.option("--watch", "-w", is_flag=True, help="Sync, run, then follow logs")
 @click.option(
     "--priority",
     type=int,
@@ -423,9 +338,6 @@ def run(
     gpus: int,
     gpu_type: str,
     name: str | None,
-    sync: bool,
-    no_sync: bool,
-    watch: bool,
     priority: int | None,
     project: str | None,
     location: str | None,
@@ -446,31 +358,13 @@ def run(
     Examples:
         inspire run "python train.py"
         inspire run "bash train.sh" --gpus 4 --type H100
-        inspire run "python train.py" --sync --watch
-
-    \b
-    With --watch:
-        1. Sync code (if --sync or --watch, unless --no-sync)
-        2. Create job
-        3. Follow logs until completion
     """
-    if sync and no_sync:
-        _handle_error(
-            ctx,
-            "ValidationError",
-            "--sync and --no-sync are mutually exclusive",
-            EXIT_VALIDATION_ERROR,
-        )
-
     _run_flow(
         ctx,
         command=command,
         gpus=gpus,
         gpu_type=gpu_type,
         name=name,
-        sync=sync,
-        watch=watch,
-        no_sync=no_sync,
         priority=priority,
         project=project,
         location=location,

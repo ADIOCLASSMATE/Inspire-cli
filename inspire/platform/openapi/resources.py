@@ -231,38 +231,6 @@ def _group_display_label(group: ComputeGroup) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Display
-# ---------------------------------------------------------------------------
-
-
-def display_available_resources(
-    *,
-    resource_specs: list[ResourceSpec],
-    compute_groups: list[ComputeGroup],
-) -> None:
-    """Print all available resource configurations."""
-    print("\n📊 Available Resource Configurations:")
-    print("=" * 60)
-
-    print("\n🖥️  GPU Spec Configurations:")
-    for spec in resource_specs:
-        print(f"  • {spec.description}")
-        print(f"    Spec ID: {spec.spec_id}")
-
-    print("\n🏢 Compute Groups:")
-    for group in compute_groups:
-        print(f"  • {group.name} ({group.location})")
-        print(f"    Compute Group ID: {group.compute_group_id}")
-
-    print("\n💡 Usage Examples:")
-    print("  • --resource 'H200'     -> 1x H200 GPU")
-    print("  • --resource '4xH200'   -> 4x H200 GPU")
-    print("  • --resource '8 H200'   -> 8x H200 GPU")
-    print("  • --resource 'H100'     -> 1x H100 GPU")
-    print("=" * 60)
-
-
-# ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
 
@@ -330,12 +298,6 @@ class ResourceManager:
 
         selected_group = select_compute_group(matching_groups, prefer_location=prefer_location)
         return selected_spec.spec_id, selected_group.compute_group_id
-
-    def display_available_resources(self) -> None:
-        display_available_resources(
-            resource_specs=self.resource_specs,
-            compute_groups=self.compute_groups,
-        )
 
 
 __all__ = ["ResourceManager"]

@@ -10,18 +10,11 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
-from enum import Enum
 
 from inspire.config import Config
+from inspire.platform.openapi.models import GPUType
 from inspire.platform.web.session import fetch_workspace_availability, get_web_session
 from inspire.compute_groups import compute_group_name_map, load_compute_groups_from_config
-
-
-class GPUType(Enum):
-    """GPU types available in the cluster."""
-
-    H100 = "H100"
-    H200 = "H200"
 
 
 @dataclass

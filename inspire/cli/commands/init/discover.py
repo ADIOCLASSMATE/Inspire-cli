@@ -38,8 +38,6 @@ _CATALOG_DROP_FIELDS = frozenset(
 
 
 class _ProbeDefaults(NamedTuple):
-    ssh_runtime: object
-    ssh_public_key: str
     probe_workspace_id: str
     logic_compute_group_id: str
     quota_id: str
@@ -163,28 +161,6 @@ def _derive_shared_path_group(path: str, *, account_key: str | None) -> str | No
         return match.group(1)
 
     return None
-
-
-def _load_ssh_public_key(pubkey_path: str | None) -> str:
-    candidates: list[Path]
-
-    if pubkey_path:
-        candidates = [Path(pubkey_path).expanduser()]
-    else:
-        candidates = [
-            Path.home() / ".ssh" / "id_ed25519.pub",
-            Path.home() / ".ssh" / "id_rsa.pub",
-        ]
-
-    for path in candidates:
-        if path.exists():
-            key = path.read_text(encoding="utf-8", errors="ignore").strip()
-            if key:
-                return key
-
-    raise ValueError(
-        "No SSH public key found. Provide --pubkey PATH or generate one with 'ssh-keygen'."
-    )
 
 
 def _select_probe_cpu_compute_group_id(compute_groups: list[dict[str, Any]]) -> str | None:
@@ -384,8 +360,6 @@ def _probe_project_shared_path_group(
     project_id: str,
     project_name: str,
     project_alias: str,
-    ssh_public_key: str,
-    ssh_runtime,  # noqa: ANN001
     logic_compute_group_id: str,
     quota_id: str,
     cpu_count: int,
@@ -397,13 +371,13 @@ def _probe_project_shared_path_group(
     keep_notebook: bool,
     timeout: int,
 ) -> dict[str, Any]:
-    # SSH/tunnel probe has been removed. Return a result indicating the feature
-    # is unavailable so the rest of the discover flow continues gracefully.
+    # Shared-path probing is no longer available. Return a result indicating
+    # the feature is unavailable so the rest of the discover flow continues gracefully.
     return {
         "notebook_id": None,
         "shared_path_group": None,
         "probe_data": None,
-        "probe_error": "SSH probe has been removed; shared-path discovery is no longer available.",
+        "probe_error": "Shared-path probing is no longer available.",
     }
 
 
@@ -512,39 +486,6 @@ def _resolve_credentials_interactive(
         raise SystemExit(1)
 
     return username, password, base_url
-
-
-def _ensure_ssh_key() -> None:
-    """Check for an SSH key; offer to generate one if missing."""
-    import subprocess
-
-    ssh_dir = Path.home() / ".ssh"
-    candidates = [ssh_dir / "id_ed25519.pub", ssh_dir / "id_rsa.pub"]
-    if any(p.exists() for p in candidates):
-        return
-
-    click.echo()
-    click.echo("No SSH key found. SSH keys are needed for bridge/tunnel/notebook SSH features.")
-
-    # Non-interactive contexts (CI, tests) must not block on prompts or fail on EOF.
-    stdin = click.get_text_stream("stdin")
-    if not getattr(stdin, "isatty", lambda: False)():
-        click.echo("Skipping SSH key generation in non-interactive mode.")
-        return
-
-    if not click.confirm("Generate a new ed25519 SSH key?", default=True):
-        return
-
-    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key_path = ssh_dir / "id_ed25519"
-    result = subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", "inspire-cli"],
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        click.echo(f"SSH key generated: {key_path}")
-    else:
-        click.echo(click.style("SSH key generation failed.", fg="yellow"))
 
 
 def _merge_alias_map(
@@ -1045,7 +986,7 @@ def _print_shared_path_group_summary(
             suffix = " ..." if len(aliases) > 8 else ""
             click.echo(f"      {sample}{suffix}")
     if "<unknown>" in shared_group_to_aliases:
-        click.echo("  Hint: run with --probe-shared-path to populate unknown shared-path groups.")
+        click.echo("  Hint: some shared-path groups could not be determined.")
 
 
 def _get_existing_workspace_aliases(
@@ -1400,11 +1341,7 @@ def _resolve_probe_defaults(
     workspace_id: str,
     browser_api_module,  # noqa: ANN001
     session,  # noqa: ANN001
-    probe_pubkey: str | None,
 ) -> _ProbeDefaults:
-    ssh_public_key = ""
-    ssh_runtime = None
-
     probe_workspace_id = str(
         getattr(config, "workspace_cpu_id", "") or merged_workspaces.get("cpu") or workspace_id
     ).strip()
@@ -1442,8 +1379,6 @@ def _resolve_probe_defaults(
     task_priority = max(1, min(9, task_priority))
 
     return _ProbeDefaults(
-        ssh_runtime=ssh_runtime,
-        ssh_public_key=ssh_public_key,
         probe_workspace_id=probe_workspace_id,
         logic_compute_group_id=logic_compute_group_id,
         quota_id=quota_id,
@@ -1535,8 +1470,6 @@ def _run_shared_path_probe(
             project_id=project_id,
             project_name=project_name,
             project_alias=project_alias,
-            ssh_public_key=probe_defaults.ssh_public_key,
-            ssh_runtime=probe_defaults.ssh_runtime,
             logic_compute_group_id=probe_defaults.logic_compute_group_id,
             quota_id=probe_defaults.quota_id,
             cpu_count=probe_defaults.cpu_count,
@@ -1812,7 +1745,6 @@ def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
             workspace_id=workspace_id,
             browser_api_module=browser_api_module,
             session=session,
-            probe_pubkey=probe_pubkey,
         )
         _run_shared_path_probe(
             browser_api_module=browser_api_module,
@@ -1865,7 +1797,6 @@ def _persist_discovery_catalog(request: _DiscoveryPersistRequest) -> None:
         click.echo(click.style("Wrote config, but could not resolve a project_id", fg="red"))
         raise SystemExit(1)
 
-    _ensure_ssh_key()
     _print_discover_completion(
         global_path=global_path,
         project_path=project_path,

@@ -72,7 +72,7 @@ def _search_job_cache(partial: str) -> list[tuple[str, str]]:
     from inspire.config import Config, ConfigError
 
     try:
-        config = Config.from_env(require_target_dir=False)
+        config, _ = Config.from_files_and_env(require_credentials=False, require_target_dir=False)
         cache_path = config.get_expanded_cache_path()
     except (ConfigError, OSError, ValueError, TypeError) as error:
         logger.debug(

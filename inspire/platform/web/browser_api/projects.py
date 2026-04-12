@@ -336,7 +336,7 @@ def select_project(
             if not fallback_group:
                 group_note = (
                     " Warning: selected fallback project has unknown shared-path group; "
-                    "run 'inspire init --discover --probe-shared-path' to populate it."
+                    "run 'inspire init --discover' to populate it."
                 )
 
         fallback_msg = (

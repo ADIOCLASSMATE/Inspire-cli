@@ -313,7 +313,7 @@ def create(
     """Create a new training job.
 
     IMPORTANT: Always set INSPIRE_TARGET_DIR before running this command (from your laptop).
-    This path should point to the shared filesystem on Bridge where training logs will be written
+    This path should point to the shared filesystem where training logs will be written
     (e.g., /train/logs).
 
     The command you provide will be wrapped to redirect stdout/stderr to this target directory:
@@ -321,13 +321,13 @@ def create(
 
     When creating a job:
       - The wrapped command is sent to Inspire API
-      - Inspire executes it on the Bridge machine
-      - Logs are written to INSPIRE_TARGET_DIR on Bridge
+      - Inspire executes it on the cluster
+      - Logs are written to INSPIRE_TARGET_DIR on the shared filesystem
       - log_path is cached in ~/.inspire/jobs.json for later retrieval
 
     When retrieving logs later:
       - Set INSPIRE_TARGET_DIR to the same path used during job creation
-      - Use `inspire job logs <job_id>` to fetch logs via Gitea bridge
+      - Use `inspire job logs <job_id>` to fetch logs via notebook exec
 
     \b
     Examples:

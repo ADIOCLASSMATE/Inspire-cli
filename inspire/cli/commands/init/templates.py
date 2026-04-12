@@ -37,34 +37,6 @@ log_pattern = "training_master_*.log"
 job_cache = "~/.inspire/jobs.json"
 log_cache_dir = "~/.inspire/logs"
 
-[git]
-# Platform selection: "gitea" or "github"
-platform = "gitea"
-
-[gitea]
-server = "https://codeberg.org"
-repo = "owner/repo"
-# token - use INSP_GITEA_TOKEN env var
-log_workflow = "retrieve_job_log.yml"
-sync_workflow = "sync_code.yml"
-bridge_workflow = "run_bridge_action.yml"
-remote_timeout = 90
-
-[github]
-server = "https://github.com"
-repo = "owner/repo"
-# token - use INSP_GITHUB_TOKEN env var
-log_workflow = "retrieve_job_log.yml"
-sync_workflow = "sync_code.yml"
-bridge_workflow = "run_bridge_action.yml"
-
-[sync]
-default_remote = "origin"
-
-[bridge]
-action_timeout = 600
-denylist = ["*.tmp", ".git/*"]
-
 [workspaces]
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
 # gpu = "ws-..."       # GPU workspace (H100/H200 jobs)

@@ -136,7 +136,7 @@ class DummyAPI:
 def patch_config_and_auth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_compute_groups: bool = False
 ) -> DummyAPI:
-    """Patch Config.from_env and AuthManager.get_api to use local stubs.
+    """Patch Config.from_files_and_env and AuthManager.get_api to use local stubs.
 
     Args:
         monkeypatch: pytest monkeypatch fixture
@@ -147,17 +147,11 @@ def patch_config_and_auth(
     config.target_dir and Path(config.target_dir).mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("INSPIRE_JOB_CACHE", config.job_cache_path)
 
-    def fake_from_env(cls, require_target_dir: bool = False) -> config_module.Config:  # type: ignore[override]
-        if require_target_dir and not config.target_dir:
-            raise ConfigError("Missing INSPIRE_TARGET_DIR")
-        return config
-
     def fake_from_files_and_env(cls, require_target_dir: bool = False, require_credentials: bool = True) -> tuple:  # type: ignore[override]
         if require_target_dir and not config.target_dir:
             raise ConfigError("Missing INSPIRE_TARGET_DIR")
         return config, {}
 
-    monkeypatch.setattr(config_module.Config, "from_env", classmethod(fake_from_env))
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
@@ -682,17 +676,13 @@ def test_job_logs_path_and_tail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
     local_log_path.write_text("line1\nline2\nline3\n", encoding="utf-8")
 
-    # Mock fetch_remote_log_via_bridge to do nothing (log already cached)
+    # Mock notebook-based log fetch to do nothing (log already cached)
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    def fake_fetch(config, job_id, remote_log_path, cache_path, refresh):  # noqa: ARG001
-        pass  # Log already exists locally
-
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", lambda *a, **kw: None)
 
     runner = CliRunner()
 
@@ -732,17 +722,13 @@ def test_job_logs_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
     local_log_path.write_text("test log content\n", encoding="utf-8")
 
-    # Mock fetch_remote_log_via_bridge
+    # Mock notebook-based log fetch
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    def fake_fetch(config, job_id, remote_log_path, cache_path, refresh):  # noqa: ARG001
-        pass
-
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fake_fetch)
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", lambda *a, **kw: None)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--json", "job", "logs", TEST_JOB_ID])
@@ -779,14 +765,13 @@ def test_job_logs_legacy_filename_is_migrated(monkeypatch: pytest.MonkeyPatch, t
 
     from importlib import import_module
 
-    job_deps = import_module("inspire.cli.commands.job.job_deps")
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
     def fail_fetch(*args, **kwargs):  # noqa: ARG001
         raise AssertionError("fetch should not be called when legacy cache exists")
 
-    monkeypatch.setattr(job_deps, "fetch_remote_log_via_bridge", fail_fetch)
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", fail_fetch)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--tail", "1"])
@@ -799,7 +784,7 @@ def test_job_logs_legacy_filename_is_migrated(monkeypatch: pytest.MonkeyPatch, t
 
 
 def test_job_logs_missing_file_sets_exit_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # Config.from_env will succeed but cache has no log_path for this job.
+    # Config.from_files_and_env will succeed but cache has no log_path for this job.
     patch_config_and_auth(monkeypatch, tmp_path)
 
     # Add job to cache WITHOUT log_path to test the "log not found" path
@@ -823,7 +808,7 @@ def test_job_logs_missing_file_sets_exit_code(monkeypatch: pytest.MonkeyPatch, t
     assert f"No log file found for job {TEST_JOB_ID}" in result.output
 
 
-def test_job_logs_follow_json_skips_ssh_follow_path(
+def test_job_logs_follow_json_uses_notebook_follow(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     patch_config_and_auth(monkeypatch, tmp_path)
@@ -844,24 +829,19 @@ def test_job_logs_follow_json_skips_ssh_follow_path(
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    called = {"workflow_follow": False}
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: True)
+    called = {"notebook_follow": False}
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: "nb-1")
     monkeypatch.setattr(
         job_logs_module,
-        "_follow_logs_via_ssh",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
-    monkeypatch.setattr(
-        job_logs_module,
-        "_follow_logs",
-        lambda *args, **kwargs: (called.__setitem__("workflow_follow", True) or EXIT_SUCCESS),
+        "_follow_logs_via_notebook",
+        lambda *a, **kw: (called.__setitem__("notebook_follow", True) or EXIT_SUCCESS),
     )
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--json", "job", "logs", TEST_JOB_ID, "--follow"])
 
     assert result.exit_code == EXIT_SUCCESS
-    assert called["workflow_follow"] is True
+    assert called["notebook_follow"] is True
 
 
 def test_job_logs_follow_returns_follow_exit_code(
@@ -885,8 +865,8 @@ def test_job_logs_follow_returns_follow_exit_code(
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
-    monkeypatch.setattr(job_logs_module, "_follow_logs", lambda *args, **kwargs: EXIT_GENERAL_ERROR)
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: "nb-1")
+    monkeypatch.setattr(job_logs_module, "_follow_logs_via_notebook", lambda *args, **kwargs: EXIT_GENERAL_ERROR)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--follow"])
@@ -894,7 +874,7 @@ def test_job_logs_follow_returns_follow_exit_code(
     assert result.exit_code == EXIT_GENERAL_ERROR
 
 
-def test_job_logs_bridge_option_uses_named_tunnel(
+def test_job_logs_notebook_option_uses_specified_notebook(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     patch_config_and_auth(monkeypatch, tmp_path)
@@ -914,77 +894,39 @@ def test_job_logs_bridge_option_uses_named_tunnel(
     from importlib import import_module
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-    observed: dict[str, str | None] = {"checked": None, "fetched": None}
+    observed: dict[str, str | None] = {"notebook_id": None}
 
-    def fake_tunnel_available(*args, **kwargs):  # noqa: ANN002, ANN003
-        observed["checked"] = kwargs.get("bridge_name")
-        return True
+    def fake_resolve(*args, **kwargs):  # noqa: ANN002, ANN003
+        # --notebook option passes the notebook id directly
+        return kwargs.get("notebook") or "nb-default"
 
-    def fake_fetch_log(*args, **kwargs):  # noqa: ANN002, ANN003
-        observed["fetched"] = kwargs.get("bridge_name")
-        return "ssh fast path content"
+    def fake_fetch(*args, **kwargs):  # noqa: ANN002, ANN003
+        observed["notebook_id"] = kwargs.get("notebook_id")
+        # Write log content to cache_path
+        import pathlib
 
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", fake_tunnel_available)
-    monkeypatch.setattr(job_logs_module, "_fetch_log_via_ssh", fake_fetch_log)
+        cache_path = kwargs.get("cache_path")
+        if cache_path:
+            pathlib.Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(cache_path).write_text("notebook fetch content\n", encoding="utf-8")
+
+    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", fake_resolve)
+    monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", fake_fetch)
 
     runner = CliRunner()
-    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--bridge", "gpu-main"])
+    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID, "--notebook", "my-nb"])
 
     assert result.exit_code == EXIT_SUCCESS
-    assert observed["checked"] == "gpu-main"
-    assert observed["fetched"] == "gpu-main"
-    assert "ssh fast path content" in result.output
 
 
-def test_job_logs_bridge_requires_job_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_job_logs_notebook_option_requires_job_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     patch_config_and_auth(monkeypatch, tmp_path)
 
     runner = CliRunner()
-    result = runner.invoke(cli_main, ["job", "logs", "--bridge", "gpu-main"])
+    result = runner.invoke(cli_main, ["job", "logs", "--notebook", "my-nb"])
 
-    assert result.exit_code == EXIT_VALIDATION_ERROR
-    assert "--bridge require a JOB_ID" in result.output
-
-
-def test_job_logs_fallback_mentions_connected_bridge_candidates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    patch_config_and_auth(monkeypatch, tmp_path)
-
-    config = make_test_config(tmp_path)
-    cache = JobCache(config.get_expanded_cache_path())
-    remote_log_path = f"/train/logs/.inspire/training_master_{TEST_JOB_ID}.log"
-    cache.add_job(
-        job_id=TEST_JOB_ID,
-        name="test-job",
-        resource="H200",
-        command="echo test",
-        status="RUNNING",
-        log_path=remote_log_path,
-    )
-
-    local_cache_dir = Path(config.log_cache_dir)
-    local_cache_dir.mkdir(parents=True, exist_ok=True)
-    local_log_path = local_cache_dir / f"{TEST_JOB_ID}.log"
-    local_log_path.write_text("cached log content\n", encoding="utf-8")
-
-    from importlib import import_module
-
-    job_logs_module = import_module("inspire.cli.commands.job.job_logs")
-    monkeypatch.setattr(job_logs_module, "is_tunnel_available", lambda *args, **kwargs: False)
-    monkeypatch.setattr(
-        job_logs_module,
-        "_find_connected_tunnel_bridges",
-        lambda exclude=None, timeout=5: ["gpu-main"],  # noqa: ARG005
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(cli_main, ["job", "logs", TEST_JOB_ID])
-
-    assert result.exit_code == EXIT_SUCCESS
-    assert "Tunnel default bridge not available" in result.output
-    assert "Connected tunnel profile(s): gpu-main" in result.output
-    assert "may not share the same remote directory/log path" in result.output
+    # --notebook without JOB_ID should fail
+    assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -1042,13 +984,9 @@ def test_config_check_auth_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     config = make_test_config(tmp_path)
     config.docker_registry = TEST_DOCKER_REGISTRY
 
-    def fake_from_env(cls, require_target_dir: bool = False) -> config_module.Config:  # type: ignore[override]
-        return config
-
     def fake_from_files_and_env(cls, require_target_dir: bool = False, require_credentials: bool = True) -> tuple:  # type: ignore[override]
         return config, {}
 
-    monkeypatch.setattr(config_module.Config, "from_env", classmethod(fake_from_env))
     monkeypatch.setattr(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )

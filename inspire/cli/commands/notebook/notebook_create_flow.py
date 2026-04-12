@@ -854,7 +854,7 @@ def maybe_run_post_start(
         )
         if not json_output and started:
             click.echo(f"{post_start_spec.label} started (log: {post_start_spec.log_path})")
-            click.echo(f'  To stop: inspire bridge exec "kill $(cat {post_start_spec.pid_file})"')
+            click.echo(f'  To stop: inspire notebook exec <notebook> "kill $(cat {post_start_spec.pid_file})"')
         if not json_output and not started:
             click.echo(
                 f"Warning: Failed to confirm {post_start_spec.label.lower()} startup; check "

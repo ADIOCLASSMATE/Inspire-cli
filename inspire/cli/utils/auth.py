@@ -35,7 +35,7 @@ class AuthManager:
             AuthenticationError: If authentication fails
         """
         if config is None:
-            config = Config.from_env()
+            config, _ = Config.from_files_and_env()
 
         # Check if we have a valid cached token
         if cls._api is not None and cls._token and time.time() < cls._expires_at:

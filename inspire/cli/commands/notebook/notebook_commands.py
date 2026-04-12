@@ -29,7 +29,6 @@ from .notebook_lookup import (
 )
 from .notebook_presenters import _print_notebook_detail, _print_notebook_list
 from .notebook_reusable_flow import NotebookIdleProbe, check_notebook_idle_via_nvidia_smi
-from .notebook_ssh_flow import notebook_ssh
 from .notebook_terminal_flow import run_notebook_terminal
 from inspire.cli.context import (
     Context,
@@ -885,15 +884,6 @@ def list_notebooks(
     _print_notebook_list(all_items, json_output)
 
 
-@click.command("ssh")
-@click.argument("notebook")
-@pass_context
-def ssh_notebook_cmd(ctx: Context, notebook: str) -> None:
-    """SSH into a running notebook instance (removed — use 'inspire notebook exec' or 'inspire notebook terminal' instead)."""
-    click.echo("inspire notebook ssh has been removed. Use 'inspire notebook exec' or 'inspire notebook terminal' instead.")
-    raise SystemExit(1)
-
-
 @click.command("terminal")
 @click.argument("notebook")
 @click.option(
@@ -911,8 +901,8 @@ def terminal_notebook_cmd(
 ) -> None:
     """Open an interactive terminal to a running notebook.
 
-    Connects directly via Jupyter terminal WebSocket — no SSH or rtunnel
-    required. Works on all notebook types (CPU, 4090, H100, H200).
+    Connects directly via Jupyter terminal WebSocket.
+    Works on all notebook types (CPU, 4090, H100, H200).
 
     \b
     Examples:
@@ -977,7 +967,7 @@ def exec_notebook_cmd(
 ) -> None:
     """Execute a command on a notebook and capture output.
 
-    Connects via Jupyter terminal WebSocket — no SSH or rtunnel required.
+    Connects via Jupyter terminal WebSocket.
     Output is streamed in real time. Exit code is propagated.
 
     Use --session to keep the connection alive between calls. The first
@@ -1008,7 +998,6 @@ __all__ = [
     "exec_notebook_cmd",
     "list_notebooks",
     "notebook_status",
-    "ssh_notebook_cmd",
     "start_notebook_cmd",
     "stop_notebook_cmd",
     "terminal_notebook_cmd",

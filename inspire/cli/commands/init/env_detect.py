@@ -16,7 +16,7 @@ from inspire.config import (
 
 
 def _redact_token_like_text(text: str) -> str:
-    """Best-effort redaction for rtunnel/Jupyter tokens in logs/config."""
+    """Best-effort redaction for Jupyter tokens in logs/config."""
     text = str(text or "")
     if not text:
         return text
@@ -67,17 +67,9 @@ def _generate_toml_content(
         "auth",
         "api",
         "paths",
-        "git",
-        "gitea",
-        "github",
-        "sync",
-        "bridge",
         "workspaces",
         "job",
         "notebook",
-        "ssh",
-        "tunnel",
-        "mirrors",
         "other",
     ]
 

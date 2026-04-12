@@ -7,8 +7,7 @@
 Inspire CLI is a command-line tool for the Inspire HPC platform:
 - Submit and manage jobs on GPU clusters
 - Monitor status and stream logs
-- Sync repositories to remote Bridge runners
-- Launch and SSH into notebook sessions
+- Launch and interact with notebook sessions (terminal & exec)
 - Inspect GPU/node availability
 
 ## Public Sync Scope (.gitignore)
@@ -22,7 +21,6 @@ Ignored/internal paths currently include:
 - `API_ENDPOINTS.md`
 - `CLAUDE.md`
 - `config.toml.example`
-- `docs/rtunnel-ssh-setup.md`
 
 When preparing `github-public` sync, avoid adding docs/tests/examples that depend on ignored files.
 
@@ -36,15 +34,13 @@ inspire-cli/
 │   │   ├── main.py
 │   │   ├── context.py
 │   │   ├── commands/
-│   │   │   ├── bridge/
 │   │   │   ├── config/
 │   │   │   ├── init/
 │   │   │   ├── job/
 │   │   │   ├── notebook/
+│   │   │   ├── project/
 │   │   │   ├── resources/
-│   │   │   ├── tunnel/
-│   │   │   ├── run.py
-│   │   │   └── sync.py
+│   │   │   └── run.py
 │   │   ├── formatters/
 │   │   └── utils/
 │   ├── config/                  # Config models/loaders/schema/options
@@ -53,14 +49,9 @@ inspire-cli/
 │   │   └── web/                 # SSO session + browser-only APIs
 │   │       ├── session/
 │   │       └── browser_api/
-│   ├── bridge/
-│   │   ├── forge/               # GitHub/Gitea Actions integrations
-│   │   └── tunnel/              # rtunnel/SSH integration
-│   ├── core/
-│   ├── features/
-│   └── api/                     # Legacy compatibility surface
+│   │           └── terminal_helpers.py  # Jupyter terminal REST + WebSocket ops
+│   └── core/
 ├── tests/
-├── examples/
 ├── AGENTS.md
 └── pyproject.toml
 ```
@@ -71,21 +62,19 @@ inspire-cli/
 inspire job ...
 inspire resources ...
 inspire config ...
-inspire sync ...
-inspire bridge ...
-inspire tunnel ...
 inspire run ...
 inspire notebook ...
+inspire image ...
+inspire project ...
 inspire init
 ```
 
-## SSH/SCP Reliability Semantics
+## Notebook Access Modes
 
-- `inspire bridge ssh` and `inspire bridge scp` should validate explicit `--bridge` names first and return `BridgeNotFound` guidance when missing (`inspire tunnel list`).
-- For tunnel failures (profile exists but SSH unavailable), the recovery flow is `inspire tunnel status`, then re-create via `inspire notebook ssh <notebook-id> --save-as <name>` when needed.
-- There is no `inspire tunnel start` command in this CLI.
-- `BridgeProfile` supports optional `notebook_id`; notebook SSH fast-path reuse is only valid when cached `notebook_id` matches the requested notebook.
-- `generate_ssh_config()` must reuse `_get_proxy_command()` so `ProxyCommand` remains shell-quoted and safe for URLs/paths with special characters.
+- `inspire notebook terminal <id>` — interactive terminal via Jupyter WebSocket
+- `inspire notebook exec <id> "<cmd>"` — non-interactive command execution
+
+SSH/tunnel/bridge/sync commands have been removed.
 
 ## Configuration Model
 
@@ -104,10 +93,6 @@ Defaults < Global TOML < Project TOML < Environment variables
 - `INSPIRE_TARGET_DIR`
 - `INSPIRE_BASE_URL`
 - `INSPIRE_SHM_SIZE`
-- `INSPIRE_BRIDGE_ACTION_TIMEOUT`
-- `INSP_GITEA_REPO`
-- `INSP_GITEA_TOKEN`
-- `INSP_GITEA_SERVER`
 
 ## Common Development Commands
 
@@ -126,7 +111,6 @@ inspire --help
 ```python
 from inspire.config import Config
 
-cfg = Config.from_env(require_credentials=True)
 cfg, sources = Config.from_files_and_env(require_credentials=True)
 ```
 
@@ -181,5 +165,5 @@ def my_command(ctx: Context) -> None:
 ## Notes
 
 - Keep reusable logic out of CLI-only `_impl` paths when possible.
-- Prefer `inspire/config`, `inspire/platform`, and `inspire/bridge` for shared logic.
+- Prefer `inspire/config` and `inspire/platform` for shared logic.
 - For public syncs, double-check changes against `.gitignore` before pushing.

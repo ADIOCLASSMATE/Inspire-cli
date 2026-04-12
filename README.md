@@ -53,48 +53,24 @@ inspire config check   # Validate API auth
 inspire resources list          # View GPU availability
 inspire notebook create --name dev --resource 4xCPU --wait
 inspire notebook terminal <id>  # Direct terminal (recommended)
-# NOTE: in some production H100/H200 environments, SSH-based notebook access may be unavailable
-# due to rtunnel bootstrap restrictions. Prefer `notebook terminal/exec` in that case.
-inspire notebook ssh <id>       # SSH into notebook (via rtunnel)
+inspire notebook exec <id> "<cmd>"  # Run a command non-interactively
 ```
 
-## Production notes (H100/H200, no SSH)
-
-In some production environments (especially offline H100/H200), SSH-based features may be unavailable because the notebook-side `rtunnel` bootstrap cannot complete.
-
-When SSH is not available:
-
-- Prefer **Jupyter WebSocket-based flows**:
-  - `inspire notebook terminal <id>` (interactive; recommended)
-  - `inspire notebook exec <id> "<cmd>"` (non-interactive)
-  - `inspire notebook exec --session ...` / `inspire notebook exec-session ...` (persistent exec session)
-- The following commands may fail (depending on tunnel availability):
-  - `inspire notebook ssh`, `inspire tunnel ...`, `inspire bridge ...`
-  - `inspire sync`
-  - `inspire job logs` (can require tunnel/SSH fast-path)
-
-Tip (shell quoting): when checking env vars through `notebook exec`, remember your **local shell expands `$VAR`** first. Use `\$VAR` (or single quotes) so the *remote* shell prints it.
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `inspire job create` | Submit a training job |
-| `inspire job status/logs/list` | Monitor and manage jobs (status/logs may require API/tunnel availability) |
+| `inspire job status/logs/list` | Monitor and manage jobs |
 | `inspire job stop/wait` | Stop or wait for a job |
 | `inspire run "<cmd>"` | Quick job with auto resource selection |
-| `inspire sync` | Sync code to shared filesystem (via SSH tunnel) |
-| `inspire bridge exec "<cmd>"` | Run command on Bridge runner |
-| `inspire bridge ssh [--bridge <name>]` | Interactive SSH shell to a Bridge profile |
-| `inspire bridge scp <source> <destination>` | Upload/download files via Bridge tunnel |
 | `inspire notebook list/create` | List or create notebook instances |
 | `inspire notebook start/stop` | Start or stop a notebook |
-| `inspire notebook terminal <id>` | Open a direct interactive terminal via Jupyter WebSocket |
-| `inspire notebook ssh <id>` | SSH into notebook via rtunnel tunnel setup |
-| `inspire notebook top` | Show GPU utilization/memory for tunnel-backed notebooks |
+| `inspire notebook terminal <id>` | Open an interactive terminal via Jupyter WebSocket |
+| `inspire notebook exec <id> "<cmd>"` | Execute a command on a notebook |
+| `inspire notebook exec-session` | Manage persistent exec sessions |
 | `inspire image list/detail` | Browse Docker images |
 | `inspire image save/register` | Save or register custom images |
-| `inspire tunnel add/list/status` | Manage SSH tunnels to Bridge |
-| `inspire tunnel ssh-config` | Generate SSH config for direct access |
 | `inspire project list` | View projects and GPU quota |
 | `inspire resources list/nodes` | View GPU availability |
 | `inspire config show/check` | Inspect and validate configuration |
@@ -110,42 +86,33 @@ inspire notebook terminal test-h100 --tmux train
 # Submit a training job
 inspire job create --name "train-v1" --resource "4xH200" --command "bash train.sh"
 
-# Quick run with auto-selected resources, sync code and follow logs
-inspire run "python train.py --epochs 100" --sync --watch
+# Quick run with auto-selected resources
+inspire run "python train.py --epochs 100"
 
-# Sync code and verify
-inspire sync && inspire bridge exec "git log -1"
-
-# Set up SSH tunnel to a notebook
-inspire notebook ssh <notebook-id> --save-as mybridge
-ssh mybridge
-
-# Check live GPU usage for all saved notebook tunnels
-inspire notebook top
-inspire notebook top --bridge mybridge --watch
-
-# Copy files through a configured bridge profile
-inspire bridge scp ./model.py /tmp/model.py --bridge mybridge
-inspire bridge scp -d /tmp/checkpoints/ ./checkpoints/ -r --bridge mybridge
+# Execute a command on a notebook
+inspire notebook exec dev-h200 "nvidia-smi"
+inspire notebook exec dev-h200 "python train.py" --timeout 3600
 
 # Check GPU availability and project quota
 inspire resources list
 inspire project list
+
+# View job logs
+inspire job logs <job-id> --tail 100
+inspire job logs <job-id> --follow
 ```
 
 ## Notebook access modes
 
-### Recommended: `inspire notebook terminal`
+### `inspire notebook terminal` (interactive)
 
 Use `inspire notebook terminal <notebook> [--tmux SESSION]` for realtime interactive work.
-It connects directly to the notebook's Jupyter terminal WebSocket, so it is best for:
+It connects directly to the notebook's Jupyter terminal WebSocket:
 
 - live terminal output
 - interactive debugging with `pdb`, `ipdb`, and `breakpoint()`
 - quick iteration from the CPU machine
 - reconnecting to a persistent tmux session
-
-Examples:
 
 ```bash
 inspire notebook terminal dev-4090
@@ -154,34 +121,21 @@ inspire notebook terminal test-h100 --tmux train
 
 Disconnect with `Ctrl+]`.
 
-### `inspire notebook ssh`
+### `inspire notebook exec` (non-interactive)
 
-Use `inspire notebook ssh <notebook>` when you specifically need an SSH-based workflow or want to save a reusable bridge profile for `ssh`, `bridge exec`, `sync`, or `bridge scp`.
+Use `inspire notebook exec <notebook> "<command>"` to run a single command and capture output:
 
-Important: on some offline H100/H200 environments, `notebook ssh` may fail if the notebook-side rtunnel/bootstrap cannot start. In that case, use `inspire notebook terminal` / `inspire notebook exec` instead.
-
-Examples:
+- scriptable, exit code propagated
+- `--json` for machine-readable output
+- `--session` for persistent sessions (keeps browser open for fast repeated commands)
 
 ```bash
-inspire notebook ssh <notebook-id>
-inspire notebook ssh <notebook-id> --save-as mybridge
-ssh mybridge
+inspire notebook exec dev-h200 "nvidia-smi"
+inspire notebook exec dev-h200 "ls -la" --json
+inspire notebook exec dev-h200 "python train.py" --session
 ```
 
-### Which one should you use?
-
-- Prefer `inspire notebook terminal` for daily debugging and interactive training.
-- Use `inspire notebook ssh` when you need SSH semantics, OpenSSH tooling, or reusable bridge profiles.
-- On this platform, the terminal workflow is typically more reliable because it avoids rtunnel and notebook-side SSH bootstrap.
-
-## SSH/SCP Reliability Notes
-
-- There is no `inspire tunnel start` command. Create or refresh bridge profiles with `inspire notebook ssh <notebook-id> --save-as <name>` (or `inspire tunnel add` / `inspire tunnel update`), then validate with `inspire tunnel status`.
-- `inspire bridge ssh` and `inspire bridge scp` validate `--bridge` names before connectivity checks. If a profile is missing, run `inspire tunnel list`.
-- Saved notebook profiles now store the source notebook ID. Reusing `--save-as <name>` for a different notebook refreshes the tunnel instead of reusing stale tunnel state.
-- `inspire bridge ssh`, `inspire bridge exec`, and interactive `inspire notebook ssh` auto-rebuild/reconnect dropped tunnels for notebook-backed profiles, using `tunnel.retries` / `tunnel.retry_pause` as retry controls.
-- Non-notebook tunnel profiles (for example, manually added profiles without `notebook_id`) cannot be auto-rebuilt and still require manual tunnel recovery.
-- `inspire tunnel ssh-config` now writes shell-quoted `ProxyCommand` entries so proxy URLs with query parameters/tokens remain safe in `~/.ssh/config`.
+Tip (shell quoting): remember your **local shell expands `$VAR`** first. Use `\$VAR` (or single quotes) so the *remote* shell prints it.
 
 ## Configuration
 
@@ -201,10 +155,6 @@ Legacy `[auth].password` is still supported, but account passwords take preceden
 
 Run `inspire init --discover` to auto-configure, or `inspire config show` to inspect the merged result.
 
-`inspire init` probe-only options are effective only with `--discover --probe-shared-path`:
-`--probe-limit`, `--probe-keep-notebooks`, `--probe-pubkey`/`--pubkey`, and `--probe-timeout`.
-Without that combination, they are accepted but ignored.
-
 Example `config.toml`:
 
 ```toml
@@ -218,10 +168,6 @@ password = "your_password"
 [api]
 base_url = "https://your-inspire-platform.com"
 
-[bridge]
-# Timeout in seconds for `inspire bridge exec`
-action_timeout = 600
-
 [workspaces]
 # cpu = "ws-..."       # Default workspace (CPU jobs / notebooks)
 # gpu = "ws-..."       # GPU workspace (H100/H200 jobs)
@@ -232,14 +178,6 @@ action_timeout = 600
 name = "H100 Cluster"
 id = "lcg-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 gpu_type = "H100"
-
-[ssh]
-# For GPU notebooks (H100/H200) without internet:
-# rtunnel_bin = "/inspire/shared/tools/rtunnel"
-# Option A: APT mirror (simpler — no pre-placed debs needed)
-# apt_mirror_url = "http://nexus.example.com/repository/ubuntu/"
-# Option B: Pre-placed dropbear debs
-# dropbear_deb_dir = "/inspire/shared/debs/dropbear"
 ```
 
 View current config:

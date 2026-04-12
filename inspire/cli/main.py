@@ -23,7 +23,6 @@ from inspire.cli.commands import (
     job,
     resources,
     config,
-    sync,
     run,
     notebook,
     init,
@@ -87,7 +86,6 @@ def main(ctx: Context, json_output: bool, debug: bool) -> None:
 main.add_command(job)
 main.add_command(resources)
 main.add_command(config)
-main.add_command(sync)
 main.add_command(run)
 main.add_command(notebook)
 main.add_command(init)

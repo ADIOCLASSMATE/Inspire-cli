@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from types import ModuleType, SimpleNamespace
 
-from inspire.platform.web.browser_api import terminal_helpers as rtunnel_module
+from inspire.platform.web.browser_api import terminal_helpers
 from inspire.platform.web.browser_api import playwright_notebooks as notebooks_module
 from inspire.platform.web.browser_api.playwright_notebooks import build_jupyter_proxy_url
 
@@ -94,9 +94,9 @@ def test_send_command_via_terminal_ws_cleans_up_terminal(monkeypatch) -> None:  
     class _Frame:
         url = "https://nb.example.com/lab"
 
-    monkeypatch.setattr(rtunnel_module, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
+    monkeypatch.setattr(terminal_helpers, "_create_terminal_via_api", lambda *_a, **_k: "term-1")
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_helpers,
         "_build_terminal_websocket_url",
         lambda _url, _term: "wss://nb.example.com/terminals/websocket/term-1",
     )
@@ -105,9 +105,9 @@ def test_send_command_via_terminal_ws_cleans_up_terminal(monkeypatch) -> None:  
         events.append(("send", kwargs))
         return True
 
-    monkeypatch.setattr(rtunnel_module, "_send_terminal_command_via_websocket", fake_send)
+    monkeypatch.setattr(terminal_helpers, "_send_terminal_command_via_websocket", fake_send)
     monkeypatch.setattr(
-        rtunnel_module,
+        terminal_helpers,
         "_delete_terminal_via_api",
         lambda _ctx, *, lab_url, term_name: events.append(("delete", f"{lab_url}|{term_name}"))
         or True,
@@ -205,9 +205,9 @@ def test_run_command_in_notebook_sync_falls_back_to_browser_terminal(monkeypatch
     monkeypatch.setattr(notebooks_module, "open_notebook_lab", lambda *_a, **_k: frame)
     monkeypatch.setattr(notebooks_module, "_send_command_via_terminal_ws", lambda **_k: False)
     monkeypatch.setattr(
-        rtunnel_module, "_open_or_create_terminal", lambda *_a, **_k: (True, "term-1")
+        terminal_helpers, "_open_or_create_terminal", lambda *_a, **_k: (True, "term-1")
     )
-    monkeypatch.setattr(rtunnel_module, "_focus_terminal_input", lambda *_a, **_k: True)
+    monkeypatch.setattr(terminal_helpers, "_focus_terminal_input", lambda *_a, **_k: True)
 
     assert (
         notebooks_module._run_command_in_notebook_sync(

@@ -64,52 +64,6 @@ def _get_config_paths() -> tuple[Path, Path]:
     help="Discover projects/workspaces and write per-account catalog",
 )
 @click.option(
-    "--probe-shared-path",
-    is_flag=True,
-    help=(
-        "Probe shared filesystem paths by SSHing into a small CPU notebook per project "
-        "(slow; creates notebooks)."
-    ),
-)
-@click.option(
-    "--probe-limit",
-    type=int,
-    default=0,
-    show_default=True,
-    help=(
-        "Limit number of projects to probe (0 = all). "
-        "Only effective with --discover --probe-shared-path."
-    ),
-)
-@click.option(
-    "--probe-keep-notebooks",
-    is_flag=True,
-    help=(
-        "Keep probe notebooks running (do not stop them after probing). "
-        "Only effective with --discover --probe-shared-path."
-    ),
-)
-@click.option(
-    "--probe-pubkey",
-    "--pubkey",
-    "probe_pubkey",
-    default=None,
-    help=(
-        "SSH public key path for probing (defaults to ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub). "
-        "Only effective with --discover --probe-shared-path."
-    ),
-)
-@click.option(
-    "--probe-timeout",
-    type=int,
-    default=900,
-    show_default=True,
-    help=(
-        "Per-project probe timeout in seconds. "
-        "Only effective with --discover --probe-shared-path."
-    ),
-)
-@click.option(
     "--template",
     "-t",
     "template_flag",
@@ -140,11 +94,6 @@ def init(
     project_flag: bool,
     force: bool,
     discover: bool,
-    probe_shared_path: bool,
-    probe_limit: int,
-    probe_keep_notebooks: bool,
-    probe_pubkey: str | None,
-    probe_timeout: int,
     template_flag: bool,
     username: str | None,
     base_url: str | None,
@@ -199,13 +148,6 @@ def init(
         if not effective_json:
             click.echo(click.style(f"Warning: {msg}", fg="yellow"))
 
-    if not discover and (
-        probe_limit or probe_keep_notebooks or probe_pubkey or probe_timeout != 900
-    ):
-        _warn(
-            "Probe options are only effective with --discover --probe-shared-path and were ignored."
-        )
-
     if not discover and (username or base_url or target_dir):
         _warn(
             "--username, --base-url, and --target-dir are only effective with --discover and were ignored."
@@ -221,11 +163,6 @@ def init(
             if global_flag or project_flag:
                 raise ValueError("--discover always writes both global and project config")
 
-            if not probe_shared_path and (
-                probe_limit or probe_keep_notebooks or probe_pubkey or probe_timeout != 900
-            ):
-                _warn("Probe options require --probe-shared-path and were ignored.")
-
             if effective_json and not force and (global_path.exists() or project_path.exists()):
                 raise ValueError(
                     "JSON mode is non-interactive for discover updates; rerun with --force when "
@@ -236,11 +173,11 @@ def init(
                 _init_discover_mode,
                 effective_json,
                 force,
-                probe_shared_path=probe_shared_path,
-                probe_limit=probe_limit,
-                probe_keep_notebooks=probe_keep_notebooks,
-                probe_pubkey=probe_pubkey,
-                probe_timeout=probe_timeout,
+                probe_shared_path=False,
+                probe_limit=0,
+                probe_keep_notebooks=False,
+                probe_pubkey=None,
+                probe_timeout=900,
                 cli_username=username,
                 cli_base_url=base_url,
                 cli_target_dir=target_dir,
@@ -252,19 +189,9 @@ def init(
                 before=before,
                 detected=[],
                 warnings=warnings,
-                discover={
-                    "probe_enabled": bool(probe_shared_path),
-                    "probe_limit": int(probe_limit),
-                    "probe_keep_notebooks": bool(probe_keep_notebooks),
-                    "probe_timeout": int(probe_timeout),
-                    "probe_pubkey_provided": bool(probe_pubkey),
-                },
                 effective_json=effective_json,
             )
             return
-
-        if probe_shared_path:
-            raise ValueError("--probe-shared-path requires --discover")
 
         if template_flag:
             if effective_json:

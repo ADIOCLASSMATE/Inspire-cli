@@ -8,8 +8,6 @@ from inspire.cli.utils.job_cache import JobCache
 from inspire.config import (
     Config,
     ConfigError,
-    _parse_denylist,
-    _parse_remote_timeout,
     build_env_exports,
 )
 
@@ -228,76 +226,6 @@ class TestJobCache:
 class TestConfig:
     """Tests for Config class and helper functions."""
 
-    def test_from_env_with_required_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test loading config from environment variables."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-        monkeypatch.delenv("INSPIRE_BASE_URL", raising=False)
-
-        config = Config.from_env()
-
-        assert config.username == "testuser"
-        assert config.password == "testpass"
-        assert config.base_url == "https://api.example.com"
-
-    def test_from_env_missing_username(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test error when username is missing."""
-        monkeypatch.delenv("INSPIRE_USERNAME", raising=False)
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-
-        with pytest.raises(ConfigError, match="Missing INSPIRE_USERNAME"):
-            Config.from_env()
-
-    def test_from_env_missing_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test error when password is missing."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.delenv("INSPIRE_PASSWORD", raising=False)
-
-        with pytest.raises(ConfigError, match="Missing INSPIRE_PASSWORD"):
-            Config.from_env()
-
-    def test_from_env_require_target_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test error when target dir is required but missing."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-        monkeypatch.delenv("INSPIRE_TARGET_DIR", raising=False)
-
-        with pytest.raises(ConfigError, match="Missing INSPIRE_TARGET_DIR"):
-            Config.from_env(require_target_dir=True)
-
-    def test_from_env_with_target_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test loading config with target dir."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-        monkeypatch.setenv("INSPIRE_TARGET_DIR", "/shared/train")
-
-        config = Config.from_env(require_target_dir=True)
-
-        assert config.target_dir == "/shared/train"
-
-    def test_from_env_with_api_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test loading config with custom API settings."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-        monkeypatch.setenv("INSPIRE_TIMEOUT", "60")
-        monkeypatch.setenv("INSPIRE_MAX_RETRIES", "5")
-        monkeypatch.setenv("INSPIRE_RETRY_DELAY", "2.5")
-
-        config = Config.from_env()
-
-        assert config.timeout == 60
-        assert config.max_retries == 5
-        assert config.retry_delay == 2.5
-
-    def test_from_env_invalid_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test error with invalid timeout value."""
-        monkeypatch.setenv("INSPIRE_USERNAME", "testuser")
-        monkeypatch.setenv("INSPIRE_PASSWORD", "testpass")
-        monkeypatch.setenv("INSPIRE_TIMEOUT", "not-a-number")
-
-        with pytest.raises(ConfigError, match="Invalid INSPIRE_TIMEOUT"):
-            Config.from_env()
-
     def test_get_expanded_cache_path(self) -> None:
         """Test that cache path ~ is expanded."""
         config = Config(
@@ -313,37 +241,6 @@ class TestConfig:
 
 class TestConfigHelpers:
     """Tests for config helper functions."""
-
-    def test_parse_remote_timeout_valid(self) -> None:
-        """Test parsing valid timeout values."""
-        assert _parse_remote_timeout("90") == 90
-        assert _parse_remote_timeout("300") == 300
-        assert _parse_remote_timeout("5") == 5
-
-    def test_parse_remote_timeout_invalid(self) -> None:
-        """Test parsing invalid timeout values."""
-        with pytest.raises(ConfigError, match="Invalid INSP_REMOTE_TIMEOUT"):
-            _parse_remote_timeout("not-a-number")
-
-    def test_parse_denylist_empty(self) -> None:
-        """Test parsing empty denylist."""
-        assert _parse_denylist(None) == []
-        assert _parse_denylist("") == []
-
-    def test_parse_denylist_comma_separated(self) -> None:
-        """Test parsing comma-separated denylist."""
-        result = _parse_denylist("*.pyc, *.pyo, __pycache__")
-        assert result == ["*.pyc", "*.pyo", "__pycache__"]
-
-    def test_parse_denylist_newline_separated(self) -> None:
-        """Test parsing newline-separated denylist."""
-        result = _parse_denylist("*.pyc\n*.pyo\n__pycache__")
-        assert result == ["*.pyc", "*.pyo", "__pycache__"]
-
-    def test_parse_denylist_mixed(self) -> None:
-        """Test parsing mixed separator denylist."""
-        result = _parse_denylist("*.pyc, *.pyo\n__pycache__")
-        assert result == ["*.pyc", "*.pyo", "__pycache__"]
 
     def test_build_env_exports_empty(self) -> None:
         """Test building env exports with empty dict."""

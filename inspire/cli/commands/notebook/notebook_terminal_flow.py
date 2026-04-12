@@ -1,7 +1,7 @@
 """Notebook interactive terminal flow.
 
 Opens an interactive terminal session to a running notebook via
-Jupyter terminal WebSocket — no SSH/rtunnel required.
+Jupyter terminal WebSocket.
 """
 
 from __future__ import annotations

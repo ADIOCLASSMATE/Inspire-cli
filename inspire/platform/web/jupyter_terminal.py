@@ -1,6 +1,6 @@
 """Interactive Jupyter terminal proxy over WebSocket.
 
-Provides an SSH-like interactive terminal experience by connecting to
+Provides an interactive terminal experience by connecting to
 a notebook's Jupyter terminal via WebSocket through Playwright's browser
 context (which handles platform authentication transparently).
 

@@ -1,6 +1,6 @@
 # Retrieve Job Log from Shared Filesystem
 #
-# This workflow runs on the self-hosted runner. It is triggered
+# This workflow runs on a self-hosted runner. It is triggered
 # manually via the API (workflow_dispatch) by the `inspire job logs` command.
 # It reads a training log file from the shared filesystem and pushes it
 # to a 'logs' branch for retrieval via the raw file API.
@@ -32,7 +32,7 @@ on:
 
 jobs:
   retrieve-log:
-    runs-on: ubuntu-latest  # Use your self-hosted Bridge runner
+    runs-on: self-hosted
     timeout-minutes: 10
 
     steps:
@@ -50,7 +50,7 @@ jobs:
           REQUEST_ID: ${{ inputs.request_id }}
           LOG_PATH: ${{ inputs.remote_log_path }}
           START_OFFSET: ${{ inputs.start_offset }}
-          GIT_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GIT_TOKEN: ${{ secrets.REPO_TOKEN }}
         run: |
           LOG_FILENAME="job-${JOB_ID}-log-${REQUEST_ID}.log"
 
@@ -64,8 +64,7 @@ jobs:
           git config user.name "Inspire Bot"
           git config user.email "bot@inspire.local"
 
-          # Remote with token auth (works on both GitHub and Gitea)
-          # GITHUB_SERVER_URL and GITHUB_REPOSITORY are available on both platforms
+          # Remote with token auth
           REMOTE_URL="https://${GITHUB_ACTOR}:${GIT_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
           git remote add origin "$REMOTE_URL"
 
