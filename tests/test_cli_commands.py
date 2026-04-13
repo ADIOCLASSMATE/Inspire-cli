@@ -64,6 +64,7 @@ def make_test_config(tmp_path: Path, include_compute_groups: bool = False) -> co
         job_cache_path=str(tmp_path / "jobs.json"),
         log_cache_dir=str(tmp_path / "log_cache"),
         job_workspace_id="ws-11111111-1111-1111-1111-111111111111",
+        job_image="registry.local/test-image:v1",
         timeout=5,
         max_retries=0,
         retry_delay=0.0,
