@@ -49,7 +49,6 @@ _SOURCE_TO_IMAGE_TYPE = {
     "official": "SOURCE_OFFICIAL",
     "public": "SOURCE_PUBLIC",
     "personal-visible": "SOURCE_PERSONAL_VISIBLE",
-    "private": "SOURCE_PERSONAL_VISIBLE",
 }
 
 # Map from API-returned source field to image_type.
@@ -65,7 +64,6 @@ _IMAGE_TYPE_TO_SOURCE_KEY = {
     "SOURCE_OFFICIAL": "official",
     "SOURCE_PUBLIC": "public",
     "SOURCE_PERSONAL_VISIBLE": "personal-visible",
-    "SOURCE_PRIVATE": "private",
 }
 
 

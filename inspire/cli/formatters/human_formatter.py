@@ -273,7 +273,7 @@ def format_image_list(images: List[Dict[str, Any]]) -> str:
     for img in images:
         name = str(img.get("name", "N/A"))[:30]
         version = str(img.get("version", ""))[:12]
-        raw_source = str(img.get("source", ""))
+        raw_source = str(img.get("display_source", img.get("source", "")))
         source = source_labels.get(raw_source, raw_source)[:10]
         status = str(img.get("status", ""))[:10]
         framework = str(img.get("framework", ""))[:14]
@@ -336,7 +336,7 @@ def format_image_detail(image_data: Dict[str, Any]) -> str:
         "SOURCE_PERSONAL_VISIBLE": "personal",
     }
 
-    raw_source = str(image_data.get("source", ""))
+    raw_source = str(image_data.get("display_source", image_data.get("source", "")))
     source = source_labels.get(raw_source, raw_source)
 
     fields = [

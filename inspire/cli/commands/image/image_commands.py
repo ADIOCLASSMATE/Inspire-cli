@@ -33,11 +33,29 @@ from inspire.platform.web import browser_api as browser_api_module
 # Helpers
 # ---------------------------------------------------------------------------
 
-_SOURCE_CHOICES = ("official", "public", "private", "personal-visible", "all")
+_SOURCE_CHOICES = ("official", "public", "personal-visible", "all")
 
 
-def _image_to_dict(img: browser_api_module.CustomImageInfo) -> dict:
-    """Convert a CustomImageInfo to a plain dict for JSON output."""
+def _image_to_dict(
+    img: browser_api_module.CustomImageInfo,
+    *,
+    queried_source: str | None = None,
+) -> dict:
+    """Convert a CustomImageInfo to a plain dict for JSON output.
+
+    Args:
+        img: The image info object.
+        queried_source: The CLI --source value used to fetch this image.
+            When "personal-visible", overrides the display source to "personal"
+            since all results are the user's personal images regardless of the
+            raw API source field.
+    """
+    # For personal-visible queries, the API may return SOURCE_PRIVATE or
+    # SOURCE_PUBLIC — but they're all the user's personal images.
+    display_source = img.source
+    if queried_source == "personal-visible":
+        display_source = "SOURCE_PERSONAL_VISIBLE"
+
     return {
         "image_id": img.image_id,
         "url": img.url,
@@ -45,6 +63,7 @@ def _image_to_dict(img: browser_api_module.CustomImageInfo) -> dict:
         "framework": img.framework,
         "version": img.version,
         "source": img.source,
+        "display_source": display_source,
         "status": img.status,
         "description": img.description,
         "created_at": img.created_at,
@@ -73,7 +92,7 @@ def _resolve_image_id(
 
     try:
         all_images: list[browser_api_module.CustomImageInfo] = []
-        for src_key in ("official", "public", "private", "personal-visible"):
+        for src_key in ("official", "public", "personal-visible"):
             items = browser_api_module.list_images_by_source(source=src_key, session=session)
             all_images.extend(items)
     except Exception:
@@ -147,12 +166,12 @@ def list_images_cmd(
 
     try:
         if source == "all":
-            for src_key in ("official", "public", "personal-visible", "private"):
+            for src_key in ("official", "public", "personal-visible"):
                 items = browser_api_module.list_images_by_source(source=src_key, session=session)
-                results.extend(_image_to_dict(img) for img in items)
+                results.extend(_image_to_dict(img, queried_source=src_key) for img in items)
         else:
             items = browser_api_module.list_images_by_source(source=source, session=session)
-            results.extend(_image_to_dict(img) for img in items)
+            results.extend(_image_to_dict(img, queried_source=source) for img in items)
     except Exception as e:
         _handle_error(ctx, "APIError", f"Failed to list images: {e}", EXIT_API_ERROR)
         return
