@@ -106,7 +106,7 @@ def _resolve_image_id(
     "--source",
     "-s",
     type=click.Choice(_SOURCE_CHOICES, case_sensitive=False),
-    default="official",
+    default="personal-visible",
     show_default=True,
     help="Image source filter",
 )
@@ -126,9 +126,9 @@ def list_images_cmd(
 
     \b
     Examples:
-        inspire image list                              # Official images
-        inspire image list --source personal-visible    # Your custom images
-        inspire image list --source personal-visible    # Web UI "personal visible" tab
+        inspire image list                              # Your personal images
+        inspire image list --source official            # Platform official images
+        inspire image list --source public              # Public community images
         inspire image list --source all                 # All sources
         inspire image list --source all --json          # JSON output
     """
@@ -147,7 +147,7 @@ def list_images_cmd(
 
     try:
         if source == "all":
-            for src_key in ("official", "public", "personal-visible"):
+            for src_key in ("official", "public", "personal-visible", "private"):
                 items = browser_api_module.list_images_by_source(source=src_key, session=session)
                 results.extend(_image_to_dict(img) for img in items)
         else:

@@ -18,6 +18,7 @@ from inspire.cli.formatters import human_formatter, json_formatter
 from inspire.cli.utils import job_submit
 from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.compute_group_autoselect import find_best_compute_group_location
+from inspire.cli.utils.image_resolver import ImageNotFoundError, resolve_image, _looks_like_full_url
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
@@ -63,6 +64,16 @@ def run_job_create(
                 EXIT_CONFIG_ERROR,
             )
             return
+
+        # Resolve short image names to full URL + image_type
+        if not _looks_like_full_url(image) or image_type is None:
+            try:
+                resolved = resolve_image(image, image_type=image_type)
+                image = resolved.url
+                image_type = resolved.image_type
+            except ImageNotFoundError as e:
+                _handle_error(ctx, "ValidationError", str(e), EXIT_VALIDATION_ERROR)
+                return
 
         try:
             requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(
@@ -263,13 +274,13 @@ def run_job_create(
 @click.option(
     "--image",
     default=None,
-    help="Custom Docker image (default from config [job].image)",
+    help="Docker image (short name or full URL; default from config [job].image)",
 )
 @click.option(
     "--image-type",
     "image_type",
     default=None,
-    help="Image source type: SOURCE_OFFICIAL, SOURCE_PUBLIC, or SOURCE_PERSONAL_VISIBLE (default: SOURCE_PERSONAL_VISIBLE)",
+    help="Image source type (auto-detected for short names; use SOURCE_OFFICIAL/SOURCE_PUBLIC/SOURCE_PERSONAL_VISIBLE to override)",
 )
 @click.option(
     "--log-file",

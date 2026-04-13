@@ -30,6 +30,8 @@
 ### Features
 
 - Added `inspire resources allocate` command — shows GPU availability and project budget overview for a resource request (`--gpus`, `--type`). Displays per-group free/preemptible/queued status and per-project budget. Read-only tool — does not create jobs. Always check this before submitting jobs with `inspire job create --location`.
+- `inspire image list` now defaults to `--source personal-visible` (your own images) instead of `official`.
+- `inspire job create` and `inspire run` now accept short image names (e.g. `dev-wjx:v-base`, `pytorch:25.06-py3`) for `--image`. The tool auto-resolves short names to the full URL and correct `image_type` by searching across image sources. Full URLs still work as before.
 
 ### Migration Guide
 
