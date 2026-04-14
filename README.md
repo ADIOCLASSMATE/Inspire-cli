@@ -194,7 +194,24 @@ id = "lcg-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 gpu_type = "H100"
 ```
 
-View current config:
+### Multi-Workspace Project Selection
+
+Project selection automatically searches **all workspaces** you have access to — not just the primary GPU workspace. If a project lives in a different workspace (e.g., a public research project space), it will appear in auto-selection candidates for `inspire job create`, `inspire run`, and `inspire resources allocate`.
+
+When a cross-workspace project is selected, the job is submitted with that project's `workspace_id` so billing and quota are tracked correctly. The compute group (physical GPU location) is still determined separately.
+
+```
+# Example: a project in a public workspace appears alongside your GPU workspace projects
+inspire project list
+#   Name                      Priority   Budget remain
+#   ----------------------------------------------------
+#   个人项目                   NORMAL     800
+#   公共科研项目               NORMAL     552
+
+# The public project is available for auto-selection when submitting H100 jobs
+inspire job create -n train -r 8xH100 -c "bash train.sh"
+# → Using project: 公共科研项目 (cross-workspace)
+```
 ```bash
 inspire config show
 inspire config show --json

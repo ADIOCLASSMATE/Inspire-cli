@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,8 +11,12 @@ from typing import Any, Optional
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web import session as web_session_module
 from inspire.platform.web.browser_api import ProjectInfo
+from inspire.platform.web.session.models import DEFAULT_WORKSPACE_ID
 from inspire.config import Config, ConfigError, build_env_exports
 from inspire.cli.utils.job_cache import JobCache
+
+# Limit parallel workspace queries during job submission.
+_JOB_PROJECT_MAX_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,165 @@ def select_project_for_workspace(
         session=session,
     )
 
+    requested_value = requested
+    if not requested_value and not config.project_order:
+        requested_value = config.job_project_id
+    if requested_value and not requested_value.startswith("project-"):
+        alias_map = config.projects or {}
+        for alias, project_id in alias_map.items():
+            if alias.lower() == requested_value.lower():
+                requested_value = project_id
+                break
+
+    shared_groups = getattr(config, "project_shared_path_groups", None)
+    if not isinstance(shared_groups, dict) or not shared_groups:
+        shared_groups = None
+
+    return browser_api_module.select_project(
+        projects,
+        requested_value,
+        shared_path_group_by_id=shared_groups,
+        project_order=config.project_order or None,
+        congested_projects=congested or None,
+    )
+
+
+def _resolve_workspace_ids(config: Config, session: web_session_module.WebSession) -> list[str]:
+    """Collect all accessible workspace IDs for project queries.
+
+    Sources (merged, deduplicated):
+      - session.all_workspace_ids (discovered at login)
+      - config workspace fields (cpu, gpu, internet, arbitrary aliases)
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def _add(ws_id: str | None) -> None:
+        val = str(ws_id or "").strip()
+        if val and val != DEFAULT_WORKSPACE_ID and val not in seen:
+            seen.add(val)
+            result.append(val)
+
+    # Prefer session-discovered workspaces first.
+    for ws_id in getattr(session, "all_workspace_ids", None) or []:
+        _add(ws_id)
+
+    # Supplement with config workspaces (may include manually-added ones).
+    _add(getattr(session, "workspace_id", None))
+    _add(config.workspace_cpu_id)
+    _add(config.workspace_gpu_id)
+    _add(config.workspace_internet_id)
+    _add(config.job_workspace_id)
+    for ws_id in (config.workspaces or {}).values():
+        _add(ws_id)
+
+    return result
+
+
+def _collect_all_workspace_projects(
+    workspace_ids: list[str],
+    session: web_session_module.WebSession,
+) -> list[ProjectInfo]:
+    """Query projects across all workspaces, deduplicating by project_id.
+
+    The first workspace is queried serially; remaining are fetched in parallel.
+    Errors for individual workspaces are silently skipped so that a single
+    bad workspace does not block job submission.
+    """
+    if not workspace_ids:
+        return []
+
+    projects: list[ProjectInfo] = []
+    seen: set[str] = set()
+
+    def _merge(items: list[ProjectInfo]) -> None:
+        for p in items:
+            if p.project_id not in seen:
+                seen.add(p.project_id)
+                projects.append(p)
+
+    # First workspace serial.
+    try:
+        first = browser_api_module.list_projects(
+            workspace_id=workspace_ids[0], session=session
+        )
+        _merge(first)
+    except Exception:
+        pass
+
+    remaining = workspace_ids[1:]
+    if not remaining:
+        return projects
+
+    # Remaining workspaces in parallel.
+    max_workers = min(len(remaining), _JOB_PROJECT_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                browser_api_module.list_projects, workspace_id=ws_id, session=session
+            ): ws_id
+            for ws_id in remaining
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                _merge(future.result())
+            except Exception:
+                pass
+
+    return projects
+
+
+def select_project_for_job(
+    config: Config,
+    *,
+    primary_workspace_id: str,
+    requested: str | None,
+) -> tuple[ProjectInfo, str | None]:
+    """Select a project for a job, searching across all accessible workspaces.
+
+    Unlike :func:`select_project_for_workspace` which queries a single workspace,
+    this function fans out to all workspaces the user can access, merges the
+    project lists, and selects from the combined pool.  This allows projects in
+    other workspaces (e.g. a public project space) to participate in automatic
+    project selection.
+
+    Returns:
+        ``(selected_project, fallback_msg)`` — the project carries its own
+        ``workspace_id`` which must be used when submitting the job so that
+        billing/quota goes to the correct project.
+    """
+    try:
+        session = web_session_module.get_web_session()
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
+
+    # Determine all workspace IDs to query.
+    workspace_ids = _resolve_workspace_ids(config, session)
+    # Ensure the primary workspace is first (already queried serially).
+    if primary_workspace_id in workspace_ids:
+        workspace_ids.remove(primary_workspace_id)
+    workspace_ids.insert(0, primary_workspace_id)
+
+    # Collect projects from all workspaces.
+    projects = _collect_all_workspace_projects(workspace_ids, session)
+    if not projects:
+        raise ConfigError("No projects available across any workspace")
+
+    # Check scheduling health for each workspace that has projects.
+    congested: set[str] = set()
+    ws_to_projects: dict[str, set[str]] = {}
+    for p in projects:
+        ws_to_projects.setdefault(p.workspace_id, set()).add(p.project_id)
+    for ws_id, pids in ws_to_projects.items():
+        try:
+            ws_congested = browser_api_module.check_scheduling_health(
+                workspace_id=ws_id, project_ids=pids, session=session
+            )
+            congested.update(ws_congested)
+        except Exception:
+            pass
+
+    # Resolve requested project name/alias.
     requested_value = requested
     if not requested_value and not config.project_order:
         requested_value = config.job_project_id
@@ -214,6 +378,7 @@ __all__ = [
     "JobSubmission",
     "build_remote_logged_command",
     "cache_created_job",
+    "select_project_for_job",
     "select_project_for_workspace",
     "submit_training_job",
     "wrap_in_bash",

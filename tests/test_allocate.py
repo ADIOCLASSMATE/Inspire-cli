@@ -159,7 +159,13 @@ def _setup_mocks(monkeypatch, groups, projects):
     )
     monkeypatch.setattr(
         "inspire.platform.web.browser_api.availability.allocate.list_projects",
-        lambda: projects,
+        lambda **kwargs: projects,
+    )
+    # get_web_session should fail so _list_projects_all_workspaces falls back
+    # to the mocked list_projects().
+    monkeypatch.setattr(
+        "inspire.platform.web.browser_api.availability.allocate.get_web_session",
+        lambda: (_ for _ in ()).throw(ValueError("no session")),
     )
 
 

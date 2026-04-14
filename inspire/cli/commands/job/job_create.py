@@ -145,9 +145,9 @@ def run_job_create(
                     )
 
         try:
-            selected, fallback_msg = job_submit.select_project_for_workspace(
+            selected, fallback_msg = job_submit.select_project_for_job(
                 config,
-                workspace_id=selected_workspace_id,
+                primary_workspace_id=selected_workspace_id,
                 requested=project,
             )
         except ValueError as e:
@@ -156,6 +156,9 @@ def run_job_create(
             return
 
         selected_project_id = selected.project_id
+        # Use the project's own workspace_id for billing/quota, even if it
+        # differs from the primary workspace (e.g. a public project space).
+        job_workspace_id = selected.workspace_id or selected_workspace_id
 
         # Cap priority to the selected project's max priority
         if selected.priority_name:
@@ -174,7 +177,11 @@ def run_job_create(
         if not ctx.json_output:
             if fallback_msg:
                 click.echo(fallback_msg)
-            click.echo(f"Using project: {selected.name}{selected.get_quota_status()}")
+            quota_status = selected.get_quota_status()
+            workspace_note = ""
+            if job_workspace_id != selected_workspace_id:
+                workspace_note = " (cross-workspace)"
+            click.echo(f"Using project: {selected.name}{quota_status}{workspace_note}")
 
         try:
             submission = job_submit.submit_training_job(
@@ -186,7 +193,7 @@ def run_job_create(
                 framework=framework,
                 location=location,
                 project_id=selected_project_id,
-                workspace_id=selected_workspace_id,
+                workspace_id=job_workspace_id,
                 image=image,
                 image_type=image_type,
                 priority=priority,

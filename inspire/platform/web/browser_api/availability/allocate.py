@@ -8,6 +8,7 @@ recommend a specific strategy.
 
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass
 
 from .api import get_accurate_gpu_availability
@@ -15,6 +16,10 @@ from inspire.platform.web.browser_api.projects import (
     ProjectInfo,
     list_projects,
 )
+from inspire.platform.web.session import DEFAULT_WORKSPACE_ID, get_web_session
+
+# Limit parallel workspace queries during allocate.
+_ALLOCATE_MAX_WORKERS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +98,67 @@ def _has_budget(project: ProjectInfo) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _list_projects_all_workspaces() -> list[ProjectInfo]:
+    """List projects across all accessible workspaces.
+
+    Falls back to the default (single-workspace) query if session
+    discovery fails or no workspace IDs are available.
+    """
+    try:
+        session = get_web_session()
+    except Exception:
+        return list_projects()
+
+    workspace_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ws_id: str | None) -> None:
+        val = str(ws_id or "").strip()
+        if val and val != DEFAULT_WORKSPACE_ID and val not in seen:
+            seen.add(val)
+            workspace_ids.append(val)
+
+    for ws_id in session.all_workspace_ids or []:
+        _add(ws_id)
+    _add(session.workspace_id)
+
+    if not workspace_ids:
+        return list_projects(session=session)
+
+    # Query first workspace serially, remaining in parallel.
+    projects: list[ProjectInfo] = []
+    project_seen: set[str] = set()
+
+    def _merge(items: list[ProjectInfo]) -> None:
+        for p in items:
+            if p.project_id not in project_seen:
+                project_seen.add(p.project_id)
+                projects.append(p)
+
+    try:
+        _merge(list_projects(workspace_id=workspace_ids[0], session=session))
+    except Exception:
+        pass
+
+    remaining = workspace_ids[1:]
+    if remaining:
+        max_workers = min(len(remaining), _ALLOCATE_MAX_WORKERS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(
+                    list_projects, workspace_id=ws_id, session=session
+                ): ws_id
+                for ws_id in remaining
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    _merge(future.result())
+                except Exception:
+                    pass
+
+    return projects or list_projects(session=session)
+
+
 def compute_allocate_overview(
     *,
     gpus: int = 8,
@@ -139,8 +205,8 @@ def compute_allocate_overview(
         for a in filtered
     ]
 
-    # 2. Fetch projects
-    projects = list_projects()
+    # 2. Fetch projects across all accessible workspaces
+    projects = _list_projects_all_workspaces()
 
     # Sort: projects with budget first, then by priority descending
     project_budgets = [

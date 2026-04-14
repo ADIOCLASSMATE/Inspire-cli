@@ -201,9 +201,9 @@ def _run_flow(
         time.sleep(0.5)
 
         try:
-            selected_project, fallback_msg = job_submit.select_project_for_workspace(
+            selected_project, fallback_msg = job_submit.select_project_for_job(
                 config,
-                workspace_id=selected_workspace_id,
+                primary_workspace_id=selected_workspace_id,
                 requested=project,
             )
         except ValueError as e:
@@ -211,12 +211,18 @@ def _run_flow(
             _handle_error(ctx, error_type, str(e), EXIT_CONFIG_ERROR)
             return
         project_id = selected_project.project_id
+        # Use the project's own workspace_id for billing/quota.
+        job_workspace_id = selected_project.workspace_id or selected_workspace_id
 
         if not ctx.json_output and fallback_msg:
             click.echo(fallback_msg)
         if ctx.debug and not ctx.json_output:
+            quota_status = selected_project.get_quota_status()
+            workspace_note = ""
+            if job_workspace_id != selected_workspace_id:
+                workspace_note = " (cross-workspace)"
             click.echo(
-                f"Using project: {selected_project.name}{selected_project.get_quota_status()}"
+                f"Using project: {selected_project.name}{quota_status}{workspace_note}"
             )
 
         try:
@@ -229,7 +235,7 @@ def _run_flow(
                 framework="pytorch",
                 location=location,
                 project_id=project_id,
-                workspace_id=selected_workspace_id,
+                workspace_id=job_workspace_id,
                 image=image,
                 image_type=image_type,
                 priority=priority,
