@@ -28,6 +28,12 @@ from inspire.platform.web.session import SessionExpiredError
 def _format_human(result: AllocateResult) -> str:
     """Format overview as human-readable output."""
     lines = [""]
+
+    # Determine if workspace column is needed
+    ws_ids_groups = {g.workspace_id for g in result.groups} - {""}
+    ws_ids_projects = {p.workspace_id for p in result.projects} - {""}
+    show_workspace = len(ws_ids_groups | ws_ids_projects) > 1
+
     lines.append(f"GPU Request: {result.gpus}x {result.gpu_type}")
     lines.append("")
     lines.append("Compute Groups:")
@@ -44,8 +50,10 @@ def _format_human(result: AllocateResult) -> str:
             tag = "PREEMPTIBLE"
         else:
             tag = "QUEUED"
+        ws_col = f"workspace={g.workspace_name or g.workspace_id:<20} " if show_workspace else ""
         lines.append(
             f"  {g.group_name:<20} "
+            f"{ws_col}"
             f"available={g.available_gpus:>5}  "
             f"low_pri={g.low_priority_gpus:>3}  "
             f"total={g.total_gpus:>5}  "
@@ -58,8 +66,10 @@ def _format_human(result: AllocateResult) -> str:
     lines.append("-" * 72)
     for p in result.projects:
         budget_str = _format_budget(p)
+        ws_col = f"workspace={p.workspace_name or p.workspace_id:<20} " if show_workspace else ""
         lines.append(
             f"  {p.project_name:<25} "
+            f"{ws_col}"
             f"priority={p.priority:<3}  "
             f"{budget_str}"
         )
@@ -101,6 +111,8 @@ def _format_json(result: AllocateResult) -> str:
                 "id": g.group_id,
                 "name": g.group_name,
                 "gpu_type": g.gpu_type,
+                "workspace_id": g.workspace_id,
+                "workspace_name": g.workspace_name,
                 "available": g.available_gpus,
                 "low_priority": g.low_priority_gpus,
                 "total": g.total_gpus,
@@ -113,6 +125,8 @@ def _format_json(result: AllocateResult) -> str:
             {
                 "id": p.project_id,
                 "name": p.project_name,
+                "workspace_id": p.workspace_id,
+                "workspace_name": p.workspace_name,
                 "priority": p.priority,
                 "remain_budget": p.remain_budget,
                 "member_remain_budget": p.member_remain_budget,

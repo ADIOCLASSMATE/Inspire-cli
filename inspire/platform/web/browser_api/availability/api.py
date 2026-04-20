@@ -107,6 +107,7 @@ def get_accurate_gpu_availability(
                 used_gpus=gpu_used,
                 available_gpus=gpu_available,
                 low_priority_gpus=gpu_low_priority,
+                workspace_id=workspace_id,
             )
         )
 

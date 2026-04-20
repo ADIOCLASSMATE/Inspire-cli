@@ -29,6 +29,7 @@ def _gpu_group(
     used_gpus: int = 32,
     available_gpus: int = 32,
     low_priority_gpus: int = 0,
+    workspace_id: str = "",
 ) -> GPUAvailability:
     return GPUAvailability(
         group_id=group_id,
@@ -38,6 +39,7 @@ def _gpu_group(
         used_gpus=used_gpus,
         available_gpus=available_gpus,
         low_priority_gpus=low_priority_gpus,
+        workspace_id=workspace_id,
     )
 
 
@@ -45,6 +47,7 @@ def _project(
     project_id: str = "p1",
     name: str = "TestProject",
     *,
+    workspace_id: str = "ws-test",
     budget: float | None = None,
     remain_budget: float | None = None,
     member_remain_budget: float | None = None,
@@ -56,7 +59,7 @@ def _project(
     return ProjectInfo(
         project_id=project_id,
         name=name,
-        workspace_id="ws-test",
+        workspace_id=workspace_id,
         budget=budget,
         remain_budget=remain_budget,
         member_remain_budget=member_remain_budget,
@@ -154,7 +157,7 @@ def test_group_negative_available_still_preemptible() -> None:
 
 def _setup_mocks(monkeypatch, groups, projects):
     monkeypatch.setattr(
-        "inspire.platform.web.browser_api.availability.allocate.get_accurate_gpu_availability",
+        "inspire.platform.web.browser_api.availability.allocate._get_gpu_availability_all_workspaces",
         lambda: groups,
     )
     monkeypatch.setattr(
@@ -244,3 +247,61 @@ def test_overview_projects_sorted_budget_then_priority(monkeypatch) -> None:
     assert result.projects[0].project_name == "BudgetHighPri"
     assert result.projects[1].project_name == "BudgetLowPri"
     assert result.projects[2].has_budget is False
+
+
+def test_overview_filters_projects_by_gpu_workspace(monkeypatch) -> None:
+    """Projects in workspaces without H200 groups are excluded."""
+    groups = [
+        _gpu_group(group_id="g1", group_name="H200-A", workspace_id="ws-alpha"),
+    ]
+    projects = [
+        _project(project_id="p1", name="AlphaProject", workspace_id="ws-alpha",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+        _project(project_id="p2", name="BetaProject", workspace_id="ws-beta",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+    ]
+    _setup_mocks(monkeypatch, groups, projects)
+
+    result = compute_allocate_overview(gpus=8, gpu_type="H200")
+    assert len(result.projects) == 1
+    assert result.projects[0].project_name == "AlphaProject"
+
+
+def test_overview_shows_all_projects_when_no_workspace_id(monkeypatch) -> None:
+    """When workspace_id is empty on groups, all projects are shown (graceful degradation)."""
+    groups = [
+        _gpu_group(group_id="g1", group_name="H200-A", workspace_id=""),
+    ]
+    projects = [
+        _project(project_id="p1", name="ProjectA", workspace_id="ws-alpha",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+        _project(project_id="p2", name="ProjectB", workspace_id="ws-beta",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+    ]
+    _setup_mocks(monkeypatch, groups, projects)
+
+    result = compute_allocate_overview(gpus=8, gpu_type="H200")
+    assert len(result.projects) == 2  # Both shown -- cannot filter without workspace info
+
+
+def test_overview_includes_groups_from_multiple_workspaces(monkeypatch) -> None:
+    """Groups from multiple workspaces are all included."""
+    groups = [
+        _gpu_group(group_id="g1", group_name="H200-A", workspace_id="ws-alpha", available_gpus=16),
+        _gpu_group(group_id="g2", group_name="H200-B", workspace_id="ws-beta", available_gpus=32),
+    ]
+    projects = [
+        _project(project_id="p1", name="AlphaProject", workspace_id="ws-alpha",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+        _project(project_id="p2", name="BetaProject", workspace_id="ws-beta",
+                 budget=100.0, remain_budget=50.0, member_remain_budget=10.0),
+    ]
+    _setup_mocks(monkeypatch, groups, projects)
+
+    result = compute_allocate_overview(gpus=8, gpu_type="H200")
+    assert len(result.groups) == 2
+    assert len(result.projects) == 2
+    # Sorted: free groups first, then by available_gpus desc
+    # ws-beta (32 available) comes before ws-alpha (16 available)
+    assert result.groups[0].workspace_id == "ws-beta"
+    assert result.groups[1].workspace_id == "ws-alpha"

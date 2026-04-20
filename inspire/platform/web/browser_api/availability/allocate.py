@@ -38,6 +38,8 @@ class GroupStatus:
     low_priority_gpus: int
     total_gpus: int
     gpus_needed: int
+    workspace_id: str = ""
+    workspace_name: str = ""
 
     @property
     def has_free(self) -> bool:
@@ -59,6 +61,8 @@ class ProjectBudget:
     remain_budget: float | None
     member_remain_budget: float | None
     has_budget: bool
+    workspace_id: str = ""
+    workspace_name: str = ""
 
 
 @dataclass
@@ -96,6 +100,20 @@ def _has_budget(project: ProjectInfo) -> bool:
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
+
+
+def _get_workspace_name_map() -> dict[str, str]:
+    """Build workspace_id -> workspace_name lookup from the current session."""
+    try:
+        session = get_web_session()
+    except Exception:
+        return {}
+    names = getattr(session, "all_workspace_names", None) or {}
+    result: dict[str, str] = dict(names)
+    ws_id = getattr(session, "workspace_id", None)
+    if ws_id and ws_id not in result:
+        result[ws_id] = ""
+    return result
 
 
 def _list_projects_all_workspaces() -> list[ProjectInfo]:
@@ -159,6 +177,67 @@ def _list_projects_all_workspaces() -> list[ProjectInfo]:
     return projects or list_projects(session=session)
 
 
+def _get_gpu_availability_all_workspaces() -> list[GPUAvailability]:
+    """Fetch GPU availability across all accessible workspaces.
+
+    Falls back to the default (single-workspace) query if session
+    discovery fails or no workspace IDs are available.
+    """
+    try:
+        session = get_web_session()
+    except Exception:
+        return get_accurate_gpu_availability()
+
+    workspace_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ws_id: str | None) -> None:
+        val = str(ws_id or "").strip()
+        if val and val != DEFAULT_WORKSPACE_ID and val not in seen:
+            seen.add(val)
+            workspace_ids.append(val)
+
+    for ws_id in session.all_workspace_ids or []:
+        _add(ws_id)
+    _add(session.workspace_id)
+
+    if not workspace_ids:
+        return get_accurate_gpu_availability(session=session)
+
+    # Query first workspace serially, remaining in parallel.
+    results: list[GPUAvailability] = []
+    group_seen: set[str] = set()
+
+    def _merge(items: list[GPUAvailability]) -> None:
+        for g in items:
+            if g.group_id not in group_seen:
+                group_seen.add(g.group_id)
+                results.append(g)
+
+    try:
+        _merge(get_accurate_gpu_availability(workspace_id=workspace_ids[0], session=session))
+    except Exception:
+        pass
+
+    remaining = workspace_ids[1:]
+    if remaining:
+        max_workers = min(len(remaining), _ALLOCATE_MAX_WORKERS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(
+                    get_accurate_gpu_availability, workspace_id=ws_id, session=session
+                ): ws_id
+                for ws_id in remaining
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    _merge(future.result())
+                except Exception:
+                    pass
+
+    return results or get_accurate_gpu_availability(session=session)
+
+
 def compute_allocate_overview(
     *,
     gpus: int = 8,
@@ -176,10 +255,10 @@ def compute_allocate_overview(
     Returns:
         AllocateResult with group statuses and project budgets.
     """
-    # 1. Fetch availability
-    availability = get_accurate_gpu_availability()
+    # 1. Fetch availability across ALL workspaces
+    availability = _get_gpu_availability_all_workspaces()
 
-    # Filter by GPU type
+    # 2. Filter by GPU type
     gpu_type_upper = gpu_type.upper()
     filtered = [
         a for a in availability
@@ -188,6 +267,14 @@ def compute_allocate_overview(
 
     if not filtered:
         raise ValueError(f"No compute groups found for GPU type '{gpu_type}'")
+
+    # 3. Determine which workspaces have the requested GPU type
+    gpu_accessible_workspace_ids: set[str] = {
+        a.workspace_id for a in filtered if a.workspace_id
+    }
+
+    # 4. Build workspace_id -> workspace_name lookup
+    ws_name_map = _get_workspace_name_map()
 
     # Sort: free groups first, then by available_gpus descending
     filtered.sort(key=lambda a: (a.available_gpus >= gpus, a.available_gpus), reverse=True)
@@ -201,12 +288,21 @@ def compute_allocate_overview(
             low_priority_gpus=a.low_priority_gpus,
             total_gpus=a.total_gpus,
             gpus_needed=gpus,
+            workspace_id=a.workspace_id,
+            workspace_name=ws_name_map.get(a.workspace_id, ""),
         )
         for a in filtered
     ]
 
-    # 2. Fetch projects across all accessible workspaces
+    # 5. Fetch projects across all accessible workspaces
     projects = _list_projects_all_workspaces()
+
+    # 6. Filter projects: only those in workspaces that have the requested GPU type
+    if gpu_accessible_workspace_ids:
+        projects = [
+            p for p in projects
+            if p.workspace_id in gpu_accessible_workspace_ids
+        ]
 
     # Sort: projects with budget first, then by priority descending
     project_budgets = [
@@ -217,6 +313,8 @@ def compute_allocate_overview(
             remain_budget=p.remain_budget,
             member_remain_budget=p.member_remain_budget,
             has_budget=_has_budget(p),
+            workspace_id=p.workspace_id,
+            workspace_name=ws_name_map.get(p.workspace_id, ""),
         )
         for p in projects
     ]

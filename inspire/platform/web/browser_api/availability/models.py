@@ -16,6 +16,7 @@ class GPUAvailability:
     used_gpus: int
     available_gpus: int
     low_priority_gpus: int  # GPUs used by low-priority tasks (can be preempted)
+    workspace_id: str = ""
     free_nodes: int = 0
     gpu_per_node: int = 0
     selection_source: str = "aggregate"
