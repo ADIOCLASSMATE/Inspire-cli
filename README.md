@@ -56,27 +56,111 @@ inspire notebook terminal <id>  # Direct terminal (recommended)
 inspire notebook exec <id> "<cmd>"  # Run a command non-interactively
 ```
 
-## Commands
+## Architecture
+
+The CLI uses two API surfaces, both via the `/api/v1` prefix with web session (cookie-based) authentication:
+
+- **Browser API** (`/api/v1/*`): All commands use this. Authenticated via Playwright SSO browser login.
+- **Notebook WebSocket**: Interactive terminal (`notebook terminal`) and command execution (`notebook exec`) connect directly to Jupyter terminal WebSocket.
+
+## Command Reference
+
+### Job Management (`inspire job`)
 
 | Command | Description |
 |---------|-------------|
-| `inspire job create` | Submit a training job with explicit resource and location |
-| `inspire job status/logs/list` | Monitor and manage jobs |
-| `inspire job stop/wait` | Stop or wait for a job |
-| `inspire run "<cmd>"` | Quick job submission (auto-selects location) |
-| `inspire resources allocate` | Show GPU availability & project budget overview |
-| `inspire resources list/nodes` | View GPU availability |
-| `inspire notebook list/create` | List or create notebook instances |
-| `inspire notebook start/stop` | Start or stop a notebook |
-| `inspire notebook terminal <id>` | Open an interactive terminal via Jupyter WebSocket |
-| `inspire notebook exec <id> "<cmd>"` | Execute a command on a notebook |
-| `inspire notebook exec-session` | Manage persistent exec sessions |
-| `inspire image list/detail` | Browse Docker images |
-| `inspire image save/register` | Save or register custom images |
-| `inspire project list` | View projects and GPU quota |
-| `inspire config show/check` | Inspect and validate configuration |
+| `inspire job create -n NAME -r RESOURCE -c COMMAND` | Submit a training job |
+| `inspire job list [-n LIMIT] [-s STATUS] [--active] [--watch]` | List recent jobs from local cache |
+| `inspire job status <job-id>` | Check job status |
+| `inspire job logs <job-id> [--tail N] [--follow]` | View training logs |
+| `inspire job logs [--status RUNNING]` | Bulk fetch logs for cached jobs |
+| `inspire job stop <job-id>` | Stop a running job |
+| `inspire job wait <job-id> [--timeout S] [--interval S]` | Wait for job completion |
+| `inspire job update [-s STATUS] [-n LIMIT]` | Refresh cached job statuses from API |
+| `inspire job command <job-id>` | Show the training command used for a job |
+
+Key options for `job create`:
+- `--name`, `-n`: Job name (required)
+- `--resource`, `-r`: Resource spec like `4xH200`, `8xH100` (required)
+- `--command`, `-c`: Start command (required)
+- `--framework`: Training framework (default: pytorch)
+- `--priority`: Task priority 1-10
+- `--max-time`: Max runtime in hours (default: 100)
+- `--location`: Preferred datacenter location
+- `--workspace`: Workspace name (from `[workspaces]`)
+- `--project`, `-p`: Project name or ID
+- `--image`: Docker image URL or short name
+- `--nodes`: Number of nodes for multi-node training (default: 1)
+- `--auto/--no-auto`: Auto-select best location (default: auto)
+- `--log-file`: Custom remote log file path
+
+### Quick Run (`inspire run`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire run "<cmd>" [--gpus N] [--type H100\|H200]` | Quick job submission with auto-selected resources |
+
+A simplified wrapper around `job create` that auto-generates a job name and auto-selects the best compute group.
+
+### Resource Management (`inspire resources`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire resources list` | GPU availability (accurate real-time by default) |
+| `inspire resources list --workspace` | Per-node workspace-scoped availability |
+| `inspire resources list --watch` | Continuously watch availability |
+| `inspire resources nodes [--group NAME]` | Free 8-GPU nodes per compute group |
+| `inspire resources allocate [--gpus N] [--type H100\|H200]` | GPU availability + project budget overview |
+
+### Notebook Management (`inspire notebook`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire notebook list [-n LIMIT] [-s STATUS] [--all]` | List notebook instances |
+| `inspire notebook reusable -r RESOURCE` | Find reusable idle running notebooks |
+| `inspire notebook status <id>` | Get notebook status |
+| `inspire notebook create [-r RESOURCE] [-n NAME]` | Create a new notebook instance |
+| `inspire notebook start <id> [--wait]` | Start a stopped notebook |
+| `inspire notebook stop <id>` | Stop a running notebook |
+| `inspire notebook terminal <id> [--tmux SESSION]` | Open interactive terminal via WebSocket |
+| `inspire notebook exec <id> "<cmd>" [--timeout S] [--session]` | Execute a command on a notebook |
+| `inspire notebook exec-session start <id> [--cwd DIR] [--env KEY=VAL]` | Start persistent exec session |
+| `inspire notebook exec-session stop <id>` | Stop persistent exec session |
+| `inspire notebook exec-session list` | List local exec sessions |
+
+### Image Management (`inspire image`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire image list [--source official\|public\|personal-visible\|all]` | List available Docker images |
+| `inspire image detail <image-id>` | Show image details |
+| `inspire image register -n NAME -v VERSION` | Register an external Docker image |
+| `inspire image save <notebook-id> -n NAME` | Save a running notebook as an image |
+| `inspire image delete <image-id> [--force]` | Delete a custom image |
+| `inspire image set-default --job NAME --notebook NAME` | Set default images in project config |
+
+### Project Management (`inspire project`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire project list [--all-workspaces]` | List projects and GPU quota/budget |
+
+### Configuration (`inspire config`)
+
+| Command | Description |
+|---------|-------------|
+| `inspire config show` | Display merged configuration with sources |
+| `inspire config check` | Validate API auth and configuration |
+| `inspire config env [--template full\|minimal]` | Generate .env template file |
+
+### Setup (`inspire init`)
+
+| Command | Description |
+|---------|-------------|
 | `inspire init` | Generate starter config from env vars |
 | `inspire init --discover` | Auto-discover projects, workspaces, compute groups |
+| `inspire init --template` | Create template with placeholders |
+| `inspire init --force` | Overwrite existing files |
 
 ## Typical Agent Workflow
 
@@ -212,14 +296,6 @@ inspire project list
 inspire job create -n train -r 8xH100 -c "bash train.sh"
 # → Using project: 公共科研项目 (cross-workspace)
 ```
-```bash
-inspire config show
-inspire config show --json
-inspire config check   # Validate config + API auth
-inspire --json config check
-inspire config check --json
-inspire init --json --template --project --force
-```
 
 ## Environment Variables
 
@@ -228,7 +304,7 @@ inspire init --json --template --project --force
 | `INSPIRE_USERNAME` | Platform username |
 | `INSPIRE_PASSWORD` | Platform password |
 | `INSPIRE_BASE_URL` | API base URL |
-| `INSPIRE_TARGET_DIR` | Shared filesystem path |
+| `INSPIRE_TARGET_DIR` | Shared filesystem path for training logs |
 | `INSPIRE_WORKSPACE_ID` | Default workspace ID |
 | `INSPIRE_WORKSPACE_CPU_ID` | CPU workspace ID (default workspace) |
 | `INSPIRE_WORKSPACE_GPU_ID` | GPU workspace ID (H100/H200) |
@@ -236,3 +312,6 @@ inspire init --json --template --project --force
 | `INSPIRE_PROJECT_ID` | Default project ID |
 | `INSP_IMAGE` | Default Docker image |
 | `INSP_PRIORITY` | Job priority (1-10) |
+| `INSPIRE_SHM_SIZE` | Shared memory size in GB for jobs/notebooks |
+| `INSPIRE_DOCKER_REGISTRY` | Docker registry URL |
+| `INSPIRE_JOB_CACHE` | Override path for job cache file |

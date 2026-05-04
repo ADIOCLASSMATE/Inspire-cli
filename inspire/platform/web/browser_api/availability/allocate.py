@@ -4,19 +4,27 @@ Shows the current state of all matching compute groups and project budgets,
 letting the user decide the best course of action. This is a **read-only
 information tool** — it never creates jobs or instances, and it does NOT
 recommend a specific strategy.
+
+When low-priority GPUs are detected, enriches the result with per-node
+preemptibility analysis via cluster_metric endpoints.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 
 from .api import get_accurate_gpu_availability
+from .metrics import TaskDimension, list_task_dimension, list_node_dimension
+from .models import GPUAvailability
 from inspire.platform.web.browser_api.projects import (
     ProjectInfo,
     list_projects,
 )
 from inspire.platform.web.session import DEFAULT_WORKSPACE_ID, get_web_session
+
+logger = logging.getLogger(__name__)
 
 # Limit parallel workspace queries during allocate.
 _ALLOCATE_MAX_WORKERS = 8
@@ -73,6 +81,54 @@ class AllocateResult:
     gpu_type: str
     groups: list[GroupStatus]
     projects: list[ProjectBudget]
+    preemptibility: dict[str, GroupPreemptibility] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Preemptibility models
+# ---------------------------------------------------------------------------
+
+# Priority threshold: tasks with priority <= this are considered preemptible.
+LOW_PRIORITY_THRESHOLD = 3
+
+
+@dataclass(frozen=True)
+class PreemptibleTask:
+    """A low-priority task found on a node."""
+
+    id: str
+    name: str
+    priority: int
+    user: str
+    gpu_used: int
+
+
+@dataclass(frozen=True)
+class PreemptibleNode:
+    """A node containing low-priority tasks."""
+
+    node_name: str
+    gpu_total: int
+    gpu_preemptible: int  # GPUs held by priority <= LOW_PRIORITY_THRESHOLD tasks
+    gpu_other: int  # GPUs held by priority > LOW_PRIORITY_THRESHOLD tasks
+    is_fully_preemptible: bool  # all tasks on node are low-priority AND node is schedulable
+    is_schedulable: bool  # True when status == "Ready"
+    status: str  # node status from API, e.g. "Ready" or "SchedulingDisabled"
+    low_priority_tasks: tuple[PreemptibleTask, ...]
+
+
+@dataclass(frozen=True)
+class GroupPreemptibility:
+    """Preemptibility analysis for a single compute group."""
+
+    group_id: str
+    group_name: str
+    fully_preemptible_nodes: int  # schedulable nodes where ALL tasks are low-priority
+    partially_preemptible_nodes: int  # schedulable nodes with SOME low-priority tasks
+    preemptible_gpus_on_mixed_nodes: int  # low-pri GPUs on schedulable mixed nodes
+    unschedulable_preemptible_nodes: int  # preemptible nodes with status != Ready
+    unschedulable_preemptible_gpus: int  # low-pri GPUs on unschedulable nodes
+    preemptible_nodes: tuple[PreemptibleNode, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +219,7 @@ def _list_projects_all_workspaces() -> list[ProjectInfo]:
         max_workers = min(len(remaining), _ALLOCATE_MAX_WORKERS)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(
-                    list_projects, workspace_id=ws_id, session=session
-                ): ws_id
+                pool.submit(list_projects, workspace_id=ws_id, session=session): ws_id
                 for ws_id in remaining
             }
             for future in concurrent.futures.as_completed(futures):
@@ -260,18 +314,13 @@ def compute_allocate_overview(
 
     # 2. Filter by GPU type
     gpu_type_upper = gpu_type.upper()
-    filtered = [
-        a for a in availability
-        if gpu_type_upper in (a.gpu_type or "").upper()
-    ]
+    filtered = [a for a in availability if gpu_type_upper in (a.gpu_type or "").upper()]
 
     if not filtered:
         raise ValueError(f"No compute groups found for GPU type '{gpu_type}'")
 
     # 3. Determine which workspaces have the requested GPU type
-    gpu_accessible_workspace_ids: set[str] = {
-        a.workspace_id for a in filtered if a.workspace_id
-    }
+    gpu_accessible_workspace_ids: set[str] = {a.workspace_id for a in filtered if a.workspace_id}
 
     # 4. Build workspace_id -> workspace_name lookup
     ws_name_map = _get_workspace_name_map()
@@ -299,10 +348,7 @@ def compute_allocate_overview(
 
     # 6. Filter projects: only those in workspaces that have the requested GPU type
     if gpu_accessible_workspace_ids:
-        projects = [
-            p for p in projects
-            if p.workspace_id in gpu_accessible_workspace_ids
-        ]
+        projects = [p for p in projects if p.workspace_id in gpu_accessible_workspace_ids]
 
     # Sort: projects with budget first, then by priority descending
     project_budgets = [
@@ -320,12 +366,228 @@ def compute_allocate_overview(
     ]
     project_budgets.sort(key=lambda p: (p.has_budget, p.priority), reverse=True)
 
+    # 7. Enrich with preemptibility analysis for groups that have low-priority GPUs
+    preemptibility = _compute_preemptibility(filtered)
+
     return AllocateResult(
         gpus=gpus,
         gpu_type=gpu_type,
         groups=groups,
         projects=project_budgets,
+        preemptibility=preemptibility,
     )
 
 
-__all__ = ["AllocateResult", "GroupStatus", "ProjectBudget", "compute_allocate_overview"]
+__all__ = [
+    "AllocateResult",
+    "GroupPreemptibility",
+    "GroupStatus",
+    "PreemptibleNode",
+    "PreemptibleTask",
+    "ProjectBudget",
+    "compute_allocate_overview",
+    "LOW_PRIORITY_THRESHOLD",
+]
+
+
+# ---------------------------------------------------------------------------
+# Preemptibility analysis
+# ---------------------------------------------------------------------------
+
+
+def _compute_preemptibility(
+    filtered_availability: list,
+) -> dict[str, GroupPreemptibility]:
+    """Compute per-group preemptibility using cluster_metric endpoints.
+
+    For each group that has low_priority_gpus > 0, fetches per-task
+    priority data and per-node task assignments, then cross-references
+    to identify which nodes have preemptible tasks.
+
+    Returns a dict keyed by group_id. Groups with no low-priority GPUs
+    or that fail to fetch are omitted.
+    """
+    result: dict[str, GroupPreemptibility] = {}
+
+    # Collect (workspace_id, resource_type) pairs from filtered groups.
+    # resource_type is the GPU type string (e.g. "NVIDIA_H200_SXM_141G").
+    # We need it for the cluster_metric API filter.
+    ws_resource_map: dict[str, str] = {}
+    group_ws_map: dict[str, str] = {}
+
+    for avail in filtered_availability:
+        if avail.low_priority_gpus <= 0:
+            continue
+        ws_id = avail.workspace_id
+        gpu_type_str = _full_resource_type(avail.gpu_type)
+        if ws_id and gpu_type_str:
+            ws_resource_map[ws_id] = gpu_type_str
+            group_ws_map[avail.group_id] = ws_id
+
+    if not ws_resource_map:
+        return result
+
+    # For each workspace, fetch task and node dimensions.
+    for ws_id, resource_type in ws_resource_map.items():
+        tasks: list[TaskDimension] = []
+        try:
+            tasks = list_task_dimension(
+                workspace_id=ws_id,
+                resource_type=resource_type,
+            )
+        except Exception as e:
+            logger.debug("list_task_dimension failed for ws=%s: %s", ws_id, e)
+            continue
+
+        low_pri_tasks = {t.id: t for t in tasks if t.priority <= LOW_PRIORITY_THRESHOLD}
+
+        if not low_pri_tasks:
+            continue
+
+        # Build node -> task assignment map from task dimensions.
+        # Each task's `nodes` field tells us which nodes it occupies.
+        node_tasks: dict[str, list[TaskDimension]] = {}
+        for task in tasks:
+            for tn in task.nodes:
+                node_tasks.setdefault(tn.name, []).append(task)
+
+        # Also fetch node dimensions for groups in this workspace
+        # to get gpu totals per node. Use (node_name, group_id) as key
+        # to avoid overwriting when a node appears in multiple groups.
+        node_gpu_map: dict[tuple[str, str], int] = {}  # (node_name, group_id) -> gpu_total
+        node_status_map: dict[
+            str, str
+        ] = {}  # node_name -> status (e.g. "Ready", "SchedulingDisabled")
+        node_group_map: dict[str, str] = {}  # node_name -> group_id (first assignment)
+
+        for group_id in group_ws_map:
+            if group_ws_map.get(group_id) != ws_id:
+                continue
+            try:
+                node_dims = list_node_dimension(
+                    workspace_id=ws_id,
+                    resource_type=resource_type,
+                    logic_compute_group_id=group_id,
+                )
+                for nd in node_dims:
+                    node_gpu_map[(nd.name, group_id)] = nd.gpu_total
+                    # Track which group each node belongs to.
+                    # First assignment wins if a node appears in multiple groups.
+                    if nd.name not in node_group_map:
+                        node_group_map[nd.name] = group_id
+                    if nd.name not in node_status_map:
+                        node_status_map[nd.name] = nd.status
+            except Exception as e:
+                logger.debug("list_node_dimension failed for group=%s: %s", group_id, e)
+                continue
+
+        # Group nodes by their compute group
+        group_nodes: dict[str, list[PreemptibleNode]] = {}
+        for node_name, node_task_list in node_tasks.items():
+            group_id = node_group_map.get(node_name, "")
+            if not group_id:
+                continue
+
+            gpu_total = node_gpu_map.get((node_name, group_id), 8)
+
+            # Calculate preemptible vs other GPUs.
+            # The API doesn't provide per-node GPU usage per task.
+            # We estimate: task GPU on this node = gpu_total / node_count.
+            gpu_preemptible = 0
+            gpu_other = 0
+            low_pri_on_node: list[PreemptibleTask] = []
+
+            for task in node_task_list:
+                node_count = max(len(task.nodes), 1)
+                gpu_used = task.gpu_total // node_count if task.gpu_total > 0 else 0
+                # If this task is on this specific node, count it
+                is_on_node = any(tn.name == node_name for tn in task.nodes)
+                if not is_on_node:
+                    continue
+
+                if task.priority <= LOW_PRIORITY_THRESHOLD:
+                    gpu_preemptible += gpu_used
+                    low_pri_on_node.append(
+                        PreemptibleTask(
+                            id=task.id,
+                            name=task.name,
+                            priority=task.priority,
+                            user=task.user,
+                            gpu_used=gpu_used,
+                        )
+                    )
+                else:
+                    gpu_other += gpu_used
+
+            node_status = node_status_map.get(node_name, "Ready")
+            is_schedulable = node_status == "Ready"
+            # A node is only "fully preemptible" if all tasks are low-priority
+            # AND the node can actually accept new workloads after preemption.
+            is_fully = gpu_other == 0 and gpu_preemptible > 0 and is_schedulable
+
+            pnode = PreemptibleNode(
+                node_name=node_name,
+                gpu_total=gpu_total,
+                gpu_preemptible=gpu_preemptible,
+                gpu_other=gpu_other,
+                is_fully_preemptible=is_fully,
+                is_schedulable=is_schedulable,
+                status=node_status,
+                low_priority_tasks=tuple(low_pri_on_node),
+            )
+            group_nodes.setdefault(group_id, []).append(pnode)
+
+        # Build GroupPreemptibility for each group
+        for group_id, pnodes in group_nodes.items():
+            # Find group name
+            group_name = ""
+            for avail in filtered_availability:
+                if avail.group_id == group_id:
+                    group_name = avail.group_name
+                    break
+
+            schedulable = [p for p in pnodes if p.is_schedulable]
+            unschedulable = [p for p in pnodes if not p.is_schedulable]
+
+            fully = sum(1 for p in schedulable if p.is_fully_preemptible)
+            partially = sum(
+                1 for p in schedulable if not p.is_fully_preemptible and p.gpu_preemptible > 0
+            )
+            mixed_gpus = sum(p.gpu_preemptible for p in schedulable if not p.is_fully_preemptible)
+
+            result[group_id] = GroupPreemptibility(
+                group_id=group_id,
+                group_name=group_name,
+                fully_preemptible_nodes=fully,
+                partially_preemptible_nodes=partially,
+                preemptible_gpus_on_mixed_nodes=mixed_gpus,
+                unschedulable_preemptible_nodes=len(unschedulable),
+                unschedulable_preemptible_gpus=sum(p.gpu_preemptible for p in unschedulable),
+                preemptible_nodes=tuple(pnodes),
+            )
+
+    return result
+
+
+def _full_resource_type(gpu_type_display: str) -> str:
+    """Convert a display GPU type (e.g. 'H200') to the full resource_type
+    string expected by cluster_metric APIs (e.g. 'NVIDIA_H200_SXM_141G').
+
+    Returns the display string unchanged if no mapping is found — the API
+    will return an empty result in that case.
+    """
+    _TYPE_MAP: dict[str, str] = {
+        "H100": "NVIDIA_H100_SXM5_80G",
+        "H200": "NVIDIA_H200_SXM_141G",
+        "A100": "NVIDIA_A100_SXM4_80G",
+        "A800": "NVIDIA_A800_SXM4_80G",
+        "A100-40G": "NVIDIA_A100_SXM4_40G",
+    }
+    key = (gpu_type_display or "").upper().strip()
+    # Try exact match first, then substring match
+    if key in _TYPE_MAP:
+        return _TYPE_MAP[key]
+    for short, full in _TYPE_MAP.items():
+        if short in key:
+            return full
+    return gpu_type_display

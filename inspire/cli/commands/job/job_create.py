@@ -16,12 +16,13 @@ from inspire.cli.context import (
 )
 from inspire.cli.formatters import human_formatter, json_formatter
 from inspire.cli.utils import job_submit
-from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.compute_group_autoselect import find_best_compute_group_location
+from inspire.platform.web.session import SessionExpiredError
 from inspire.cli.utils.image_resolver import ImageNotFoundError, resolve_image, _looks_like_full_url
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
+from inspire.cli.utils.resource_parser import parse_resource_request
 
 
 def run_job_create(
@@ -46,7 +47,6 @@ def run_job_create(
     """Run the job creation flow."""
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True)
-        api = AuthManager.get_api(config)
 
         if priority is None:
             priority = config.job_priority
@@ -76,9 +76,7 @@ def run_job_create(
                 return
 
         try:
-            requested_gpu_type, requested_gpu_count = api.resource_manager.parse_resource_request(
-                resource
-            )
+            requested_gpu_type, requested_gpu_count = parse_resource_request(resource)
         except Exception as e:
             _handle_error(
                 ctx,
@@ -104,13 +102,16 @@ def run_job_create(
             )
             return
 
+        selected_compute_group_id = ""
         if auto and not location:
-            best, selected_location, selected_group_name = find_best_compute_group_location(
-                api,
-                gpu_type=requested_gpu_type.value,
-                min_gpus=requested_gpu_count,
-                include_preemptible=True,
-                instance_count=nodes,
+            best, selected_location, selected_group_name, selected_compute_group_id = (
+                find_best_compute_group_location(
+                    gpu_type=requested_gpu_type.value,
+                    min_gpus=requested_gpu_count,
+                    include_preemptible=True,
+                    instance_count=nodes,
+                    config_compute_groups=config.compute_groups,
+                )
             )
 
             if not best:
@@ -183,15 +184,32 @@ def run_job_create(
                 workspace_note = " (cross-workspace)"
             click.echo(f"Using project: {selected.name}{quota_status}{workspace_note}")
 
+        # Resolve compute_group_id when user specifies --location manually
+        if not selected_compute_group_id and location:
+            from inspire.compute_groups import load_compute_groups_from_config
+            if config.compute_groups:
+                for group in load_compute_groups_from_config(config.compute_groups):
+                    loc = getattr(group, "location", "")
+                    name = getattr(group, "name", "")
+                    if location in (loc, name) or location.lower() in (loc.lower(), name.lower()):
+                        selected_compute_group_id = getattr(group, "compute_group_id", "")
+                        break
+            if not selected_compute_group_id:
+                _handle_error(
+                    ctx,
+                    "ConfigError",
+                    f"No compute group matches location '{location}'",
+                    EXIT_CONFIG_ERROR,
+                )
+                return
+
         try:
             submission = job_submit.submit_training_job(
-                api,
                 config=config,
                 name=name,
                 command=command,
                 resource=resource,
                 framework=framework,
-                location=location,
                 project_id=selected_project_id,
                 workspace_id=job_workspace_id,
                 image=image,
@@ -199,6 +217,9 @@ def run_job_create(
                 priority=priority,
                 nodes=nodes,
                 max_time_hours=max_time,
+                gpu_type=requested_gpu_type.value,
+                gpu_count=requested_gpu_count,
+                compute_group_id=selected_compute_group_id,
                 project_name=selected.name,
                 log_file=log_file,
             )
@@ -248,7 +269,7 @@ def run_job_create(
 
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-    except AuthenticationError as e:
+    except SessionExpiredError as e:
         _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)
     except Exception as e:
         _handle_error(ctx, "APIError", str(e), EXIT_API_ERROR)

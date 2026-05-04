@@ -18,13 +18,11 @@ from inspire.cli.context import (
 )
 
 from inspire import config as config_module
-from inspire.cli.utils import auth as auth_module
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web import session as web_session_module
-from inspire.cli.utils.auth import AuthenticationError
+from inspire.platform.web.session import SessionExpiredError
 from inspire.config import ConfigError
 from inspire.cli.utils.job_cache import JobCache
-from inspire.platform.openapi import ResourceManager
 
 # Valid test job IDs (must match the format: job-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 TEST_JOB_ID = "job-12345678-1234-1234-1234-123456789abc"
@@ -83,61 +81,10 @@ def make_test_config(tmp_path: Path, include_compute_groups: bool = False) -> co
     return config
 
 
-class DummyAPI:
-    def __init__(self) -> None:
-        self.calls: Dict[str, Any] = {}
-        self.resource_manager = ResourceManager()
-
-    # Job-related methods -------------------------------------------------
-    def create_training_job_smart(self, **kwargs: Any) -> Dict[str, Any]:
-        self.calls["create_training_job_smart"] = kwargs
-        return {"data": {"job_id": TEST_JOB_ID}}
-
-    def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        self.calls.setdefault("get_job_detail", []).append(job_id)
-        return {
-            "data": {
-                "job_id": job_id,
-                "name": "test-job",
-                "status": "SUCCEEDED",
-                "running_time_ms": "1000",
-            }
-        }
-
-    def stop_training_job(self, job_id: str) -> None:
-        self.calls.setdefault("stop_training_job", []).append(job_id)
-
-    # Resource / nodes ----------------------------------------------------
-    def list_cluster_nodes(
-        self,
-        page_num: int,
-        page_size: int,
-        resource_pool: Optional[str],
-    ) -> Dict[str, Any]:
-        self.calls["list_cluster_nodes"] = {
-            "page_num": page_num,
-            "page_size": page_size,
-            "resource_pool": resource_pool,
-        }
-        return {
-            "data": {
-                "nodes": [
-                    {
-                        "node_id": "node-1",
-                        "resource_pool": resource_pool or "online",
-                        "status": "ready",
-                        "gpu_count": 4,
-                    }
-                ],
-                "total": 1,
-            }
-        }
-
-
 def patch_config_and_auth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, include_compute_groups: bool = False
-) -> DummyAPI:
-    """Patch Config.from_files_and_env and AuthManager.get_api to use local stubs.
+) -> None:
+    """Patch Config.from_files_and_env and get_web_session to use local stubs.
 
     Args:
         monkeypatch: pytest monkeypatch fixture
@@ -157,26 +104,56 @@ def patch_config_and_auth(
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
 
-    api = DummyAPI()
+    api = object()
 
-    def fake_get_api(self_or_cls, cfg: Optional[config_module.Config] = None) -> DummyAPI:  # type: ignore[override]
-        # Ensure we were passed the same config object
-        assert cfg is config or cfg is None
-        return api
-
-    monkeypatch.setattr(auth_module.AuthManager, "get_api", fake_get_api)
-    auth_module.AuthManager.clear_cache()
+    # Patch browser API job functions for submit_training_job pipeline
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_train_resource_prices",
+        lambda **kw: [{
+            "quota_id": "test-quota-id",
+            "cpu_count": 15,
+            "gpu_count": 1,
+            "gpu_type": "NVIDIA_H200_SXM_141G",
+            "memory_size_gib": 200,
+        }],
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "resolve_train_resource_spec_price",
+        lambda **kw: {
+            "cpu_type": "",
+            "cpu_count": 15,
+            "gpu_type": "NVIDIA_H200_SXM_141G",
+            "gpu_count": 1,
+            "memory_size_gib": 200,
+            "logic_compute_group_id": "",
+            "quota_id": "test-quota-id",
+        },
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "create_job",
+        lambda **kw: {"data": {"job_id": TEST_JOB_ID}},
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "get_job_detail",
+        lambda job_id, session=None: {
+            "data": {"job_id": job_id, "name": "test-job", "status": "SUCCEEDED"}
+        },
+    )
+    monkeypatch.setattr(
+        browser_api_module,
+        "stop_job",
+        lambda job_id, session=None: {"data": {"status": "stopped"}},
+    )
+    # Patch get_web_session (replaces old AuthManager.get_api)
+    monkeypatch.setattr(
+        web_session_module, "get_web_session", lambda **kw: api
+    )
 
     # Mock browser API calls for project selection
-    class FakeWebSession:
-        workspace_id = "ws-test-workspace"
-        storage_state = {}
-
-    monkeypatch.setattr(
-        web_session_module,
-        "get_web_session",
-        lambda: FakeWebSession(),
-    )
 
     test_project = browser_api_module.ProjectInfo(
         project_id="project-test-123",
@@ -402,11 +379,13 @@ def test_job_command_prefers_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
         log_path=None,
     )
 
-    def api_detail(job_id: str) -> Dict[str, Any]:
-        api.calls.setdefault("get_job_detail", []).append(job_id)
+    api_calls: list[str] = []
+
+    def api_detail(job_id: str, session=None) -> Dict[str, Any]:
+        api_calls.append(job_id)
         return {"data": {"job_id": job_id, "command": "api command"}}
 
-    api.get_job_detail = api_detail  # type: ignore[assignment]
+    monkeypatch.setattr(browser_api_module, "get_job_detail", api_detail)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "command", TEST_JOB_ID])
@@ -414,7 +393,7 @@ def test_job_command_prefers_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert result.exit_code == 0
     assert "api command" in result.output
     assert "cached command" not in result.output
-    assert api.calls["get_job_detail"] == [TEST_JOB_ID]
+    assert api_calls == [TEST_JOB_ID]
 
 
 def test_job_command_falls_back_to_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -431,10 +410,10 @@ def test_job_command_falls_back_to_cache(monkeypatch: pytest.MonkeyPatch, tmp_pa
         log_path=None,
     )
 
-    def api_detail(job_id: str) -> Dict[str, Any]:  # noqa: ARG001
-        raise AuthenticationError("bad credentials")
+    def api_detail(job_id: str, session=None) -> Dict[str, Any]:  # noqa: ARG001
+        raise SessionExpiredError("bad credentials")
 
-    api.get_job_detail = api_detail  # type: ignore[assignment]
+    monkeypatch.setattr(browser_api_module, "get_job_detail", api_detail)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "command", TEST_JOB_ID])
@@ -448,10 +427,10 @@ def test_job_status_not_found_sets_specific_exit_code(
 ):
     api = patch_config_and_auth(monkeypatch, tmp_path)
 
-    def failing_get_job_detail(job_id: str) -> Dict[str, Any]:
+    def failing_get_job_detail(job_id: str, session=None) -> Dict[str, Any]:
         raise RuntimeError("Job not found")
 
-    api.get_job_detail = failing_get_job_detail  # type: ignore[assignment]
+    monkeypatch.setattr(browser_api_module, "get_job_detail", failing_get_job_detail)
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["job", "status", "missing-id"])
@@ -487,7 +466,7 @@ def test_job_wait_succeeds_and_exits_zero(monkeypatch: pytest.MonkeyPatch, tmp_p
             }
         }
 
-    api.get_job_detail = get_job_detail  # type: ignore[assignment]
+    monkeypatch.setattr(browser_api_module, "get_job_detail", get_job_detail)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -513,7 +492,7 @@ def test_job_wait_json_output_has_no_human_banner(
             }
         }
 
-    api.get_job_detail = get_job_detail  # type: ignore[assignment]
+    monkeypatch.setattr(browser_api_module, "get_job_detail", get_job_detail)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -622,7 +601,7 @@ def test_job_list_watch_json_does_not_clear_screen(
 
 
 def test_job_update_refreshes_job_creating_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    api = patch_config_and_auth(monkeypatch, tmp_path)
+    patch_config_and_auth(monkeypatch, tmp_path)
 
     # Seed cache with a job in an early-stage API status that should still be refreshed
     config = make_test_config(tmp_path)
@@ -636,6 +615,14 @@ def test_job_update_refreshes_job_creating_status(monkeypatch: pytest.MonkeyPatc
         log_path=None,
     )
 
+    called_job_ids: list[str] = []
+
+    def tracking_get_job_detail(job_id: str, session=None) -> dict:
+        called_job_ids.append(job_id)
+        return {"data": {"job_id": job_id, "status": "SUCCEEDED"}}
+
+    monkeypatch.setattr(browser_api_module, "get_job_detail", tracking_get_job_detail)
+
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--json", "job", "update", "--delay", "0"])
 
@@ -647,7 +634,7 @@ def test_job_update_refreshes_job_creating_status(monkeypatch: pytest.MonkeyPatc
     assert updated_ids == {TEST_JOB_ID}
 
     # Ensure the job was actually polled and the cache was updated
-    assert api.calls["get_job_detail"] == [TEST_JOB_ID]
+    assert called_job_ids == [TEST_JOB_ID]
     refreshed = cache.get_job(TEST_JOB_ID)
     assert refreshed is not None
     assert refreshed["status"] == "SUCCEEDED"
@@ -682,7 +669,7 @@ def test_job_logs_path_and_tail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", lambda *a, **kw: None)
     monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", lambda *a, **kw: None)
 
     runner = CliRunner()
@@ -728,7 +715,7 @@ def test_job_logs_json_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", lambda *a, **kw: None)
     monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", lambda *a, **kw: None)
 
     runner = CliRunner()
@@ -771,7 +758,7 @@ def test_job_logs_legacy_filename_is_migrated(monkeypatch: pytest.MonkeyPatch, t
     def fail_fetch(*args, **kwargs):  # noqa: ARG001
         raise AssertionError("fetch should not be called when legacy cache exists")
 
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: None)
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", lambda *a, **kw: None)
     monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", fail_fetch)
 
     runner = CliRunner()
@@ -831,7 +818,12 @@ def test_job_logs_follow_json_uses_notebook_follow(
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
     called = {"notebook_follow": False}
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: "nb-1")
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", lambda *a, **kw: "nb-1")
+    monkeypatch.setattr(
+        job_logs_module,
+        "_follow_logs_via_api",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("API unavailable")),
+    )
     monkeypatch.setattr(
         job_logs_module,
         "_follow_logs_via_notebook",
@@ -866,7 +858,12 @@ def test_job_logs_follow_returns_follow_exit_code(
 
     job_logs_module = import_module("inspire.cli.commands.job.job_logs")
 
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", lambda *a, **kw: "nb-1")
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", lambda *a, **kw: "nb-1")
+    monkeypatch.setattr(
+        job_logs_module,
+        "_follow_logs_via_api",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("API unavailable")),
+    )
     monkeypatch.setattr(job_logs_module, "_follow_logs_via_notebook", lambda *args, **kwargs: EXIT_GENERAL_ERROR)
 
     runner = CliRunner()
@@ -911,7 +908,7 @@ def test_job_logs_notebook_option_uses_specified_notebook(
             pathlib.Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(cache_path).write_text("notebook fetch content\n", encoding="utf-8")
 
-    monkeypatch.setattr(job_logs_module, "_resolve_notebook_for_job", fake_resolve)
+    monkeypatch.setattr(job_logs_module, "_get_explicit_notebook_id", fake_resolve)
     monkeypatch.setattr(job_logs_module, "_fetch_and_cache_log_via_notebook", fake_fetch)
 
     runner = CliRunner()
@@ -992,12 +989,10 @@ def test_config_check_auth_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         config_module.Config, "from_files_and_env", classmethod(fake_from_files_and_env)
     )
 
-    def fake_get_api(self_or_cls, cfg: Optional[config_module.Config] = None):  # type: ignore[override]
-        from inspire.cli.utils.auth import AuthenticationError
+    def fake_load_session():
+        raise ValueError("No valid web session")
 
-        raise AuthenticationError("bad credentials")
-
-    monkeypatch.setattr(auth_module.AuthManager, "get_api", fake_get_api)
+    monkeypatch.setattr(web_session_module.models.WebSession, "load", staticmethod(fake_load_session))
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["config", "check"])
@@ -1059,7 +1054,13 @@ base_url = "https://my-inspire.internal"
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
     monkeypatch.setenv("INSPIRE_BASE_URL", "https://env.example")
-    monkeypatch.setattr(auth_module.AuthManager, "get_api", lambda _cls, cfg=None: DummyAPI())
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda **kw: object())
+
+    # Mock WebSession.load() for the auth check (config check uses cached session check)
+    class FakeSession:
+        storage_state = {"cookies": [{"name": "test", "value": "test"}]}
+
+    monkeypatch.setattr(web_session_module.models.WebSession, "load", staticmethod(lambda **kw: FakeSession()))
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--json", "config", "check"])
@@ -1096,7 +1097,11 @@ def test_config_check_accepts_local_json_alias(
     monkeypatch.setattr(
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
-    monkeypatch.setattr(auth_module.AuthManager, "get_api", lambda _cls, cfg=None: DummyAPI())
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda **kw: object())
+    monkeypatch.setattr(
+        web_session_module.models.WebSession, "load",
+        staticmethod(lambda **kw: type("Fake", (), {"storage_state": {"cookies": [{}]}})())
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["config", "check", "--json"])
@@ -1129,7 +1134,7 @@ def test_config_check_rejects_placeholder_base_url(
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
     monkeypatch.setattr(
-        auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
+        web_session_module, "get_web_session", lambda **kw: pytest.fail("should not auth")
     )
 
     runner = CliRunner()
@@ -1168,7 +1173,7 @@ def test_config_check_requires_docker_registry(
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
     monkeypatch.setattr(
-        auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
+        web_session_module, "get_web_session", lambda **kw: pytest.fail("should not auth")
     )
 
     runner = CliRunner()
@@ -1208,7 +1213,7 @@ def test_config_check_rejects_top_level_project_base_url_key(
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
     monkeypatch.setattr(
-        auth_module.AuthManager, "get_api", lambda _cls, cfg=None: pytest.fail("should not auth")
+        web_session_module, "get_web_session", lambda **kw: pytest.fail("should not auth")
     )
 
     runner = CliRunner()
@@ -1228,7 +1233,6 @@ def test_config_check_allows_path_defaults_for_endpoint_fields(
     config.base_url = "https://my-inspire.internal"
     config.docker_registry = TEST_DOCKER_REGISTRY
     config.auth_endpoint = "/auth/token"
-    config.openapi_prefix = "/openapi/v1"
     config.browser_api_prefix = "/api/v1"
 
     def fake_from_files_and_env(
@@ -1245,7 +1249,11 @@ def test_config_check_allows_path_defaults_for_endpoint_fields(
     monkeypatch.setattr(
         config_module.Config, "get_config_paths", classmethod(fake_get_config_paths)
     )
-    monkeypatch.setattr(auth_module.AuthManager, "get_api", lambda _cls, cfg=None: DummyAPI())
+    monkeypatch.setattr(web_session_module, "get_web_session", lambda **kw: object())
+    monkeypatch.setattr(
+        web_session_module.models.WebSession, "load",
+        staticmethod(lambda **kw: type("Fake", (), {"storage_state": {"cookies": [{}]}})())
+    )
 
     runner = CliRunner()
     result = runner.invoke(cli_main, ["config", "check"])

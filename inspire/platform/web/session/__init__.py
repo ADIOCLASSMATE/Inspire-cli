@@ -229,3 +229,19 @@ def clear_session_cache() -> None:
             cache_file.unlink()
         except Exception:
             continue
+
+
+def get_v2_token(config: "Config") -> str | None:
+    """Get a v2 Bearer token for API calls.
+
+    Returns None if v2 is disabled or token acquisition fails, so callers
+    can fall back to v1 cookie-based auth.
+    """
+    if not config.v2_enabled:
+        return None
+    try:
+        from inspire.platform.web.v2_api.auth import ensure_token
+
+        return ensure_token(config)
+    except Exception:
+        return None

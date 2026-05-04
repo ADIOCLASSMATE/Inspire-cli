@@ -220,22 +220,6 @@ def _project_list_cache_key(
     ).hexdigest()
 
 
-def _project_info_to_dict(project: browser_api_module.ProjectInfo) -> dict:
-    return {
-        "project_id": project.project_id,
-        "name": project.name,
-        "workspace_id": project.workspace_id,
-        "budget": project.budget,
-        "remain_budget": project.remain_budget,
-        "member_remain_budget": project.member_remain_budget,
-        "member_remain_gpu_hours": project.member_remain_gpu_hours,
-        "gpu_limit": project.gpu_limit,
-        "member_gpu_limit": project.member_gpu_limit,
-        "priority_level": project.priority_level,
-        "priority_name": project.priority_name,
-    }
-
-
 def _project_info_from_dict(data: dict) -> browser_api_module.ProjectInfo:
     def _float(value) -> float:  # noqa: ANN001
         if value is None or value == "":
@@ -350,7 +334,7 @@ def _save_project_cache(
 
     fresh_entries[key] = {
         "created_at": now,
-        "projects": [_project_info_to_dict(project) for project in projects],
+        "projects": [_project_to_dict(project) for project in projects],
     }
 
     if len(fresh_entries) > _PROJECT_LIST_CACHE_MAX_ENTRIES:

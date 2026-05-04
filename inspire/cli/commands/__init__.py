@@ -8,6 +8,8 @@ from inspire.cli.commands.notebook import notebook
 from inspire.cli.commands.init import init
 from inspire.cli.commands.image import image
 from inspire.cli.commands.project import project
+from inspire.cli.commands.metrics import metrics
+from inspire.cli.commands.inference import inference
 
 __all__ = [
     "job",
@@ -18,4 +20,6 @@ __all__ = [
     "init",
     "image",
     "project",
+    "metrics",
+    "inference",
 ]

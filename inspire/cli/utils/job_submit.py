@@ -1,8 +1,9 @@
-"""Shared helpers for submitting jobs via the Inspire OpenAPI client."""
+"""Shared helpers for submitting jobs via the Inspire browser API (/api/v1)."""
 
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from typing import Any, Optional
 
 from inspire.platform.web import browser_api as browser_api_module
 from inspire.platform.web import session as web_session_module
+
+logger = logging.getLogger(__name__)
 from inspire.platform.web.browser_api import ProjectInfo
 from inspire.platform.web.session.models import DEFAULT_WORKSPACE_ID
 from inspire.config import Config, ConfigError, build_env_exports
@@ -178,7 +181,7 @@ def _collect_all_workspace_projects(
         )
         _merge(first)
     except Exception:
-        pass
+        logger.debug("Primary workspace %s project query failed", workspace_ids[0], exc_info=True)
 
     remaining = workspace_ids[1:]
     if not remaining:
@@ -197,7 +200,7 @@ def _collect_all_workspace_projects(
             try:
                 _merge(future.result())
             except Exception:
-                pass
+                logger.debug("Workspace %s project query failed", futures[future], exc_info=True)
 
     return projects
 
@@ -250,7 +253,7 @@ def select_project_for_job(
             )
             congested.update(ws_congested)
         except Exception:
-            pass
+            logger.debug("Scheduling health check failed for workspace %s", ws_id, exc_info=True)
 
     # Resolve requested project name/alias.
     requested_value = requested
@@ -299,24 +302,31 @@ def cache_created_job(
 
 
 def submit_training_job(
-    api,  # noqa: ANN001
     *,
     config: Config,
     name: str,
     command: str,
     resource: str,
     framework: str,
-    location: Optional[str],
     project_id: str,
     workspace_id: str,
-    image: Optional[str],
-    image_type: Optional[str] = None,
+    image: str,
+    image_type: str,
     priority: int,
     nodes: int,
     max_time_hours: float,
+    gpu_type: str = "",
+    gpu_count: int = 0,
+    compute_group_id: str = "",
     project_name: Optional[str] = None,
     log_file: str | None = None,
 ) -> JobSubmission:
+    """Submit a training job via browser API (/api/v1/train_job/create).
+
+    Fetches resource pricing data from the server, builds the
+    ``resource_spec_price`` payload, and creates the job via
+    :func:`~inspire.platform.web.browser_api.create_job`.
+    """
     wrapped_command = wrap_in_bash(command)
     final_command, log_path = build_remote_logged_command(
         config,
@@ -326,30 +336,63 @@ def submit_training_job(
 
     max_time_ms = str(int(max_time_hours * 3600 * 1000))
 
-    create_kwargs = dict(
+    # Get web session (cookie-based auth)
+    session = web_session_module.get_web_session()
+
+    # Resolve shm_size from config
+    shm_gi = 128  # default
+    if config.shm_size is not None:
+        shm_value = int(config.shm_size)
+        if shm_value < 1:
+            raise ValueError(
+                "Shared memory size must be >= 1 (set INSPIRE_SHM_SIZE or job.shm_size)."
+            )
+        shm_gi = shm_value
+
+    # Fetch pricing data from server
+    prices = browser_api_module.get_train_resource_prices(
+        workspace_id=workspace_id,
+        logic_compute_group_id=compute_group_id,
+        session=session,
+    )
+    if not prices:
+        raise ValueError(
+            f"No pricing data for compute group {compute_group_id}. "
+            "Verify the compute group supports training jobs."
+        )
+
+    # Build resource_spec_price from pricing data
+    resource_spec_price = browser_api_module.resolve_train_resource_spec_price(
+        resource_prices=prices,
+        gpu_count=gpu_count,
+        gpu_type=gpu_type,
+        logic_compute_group_id=compute_group_id,
+    )
+
+    # Extract cpu/mem from matched pricing data
+    cpu_count = resource_spec_price.get("cpu_count", 180)
+    mem_gi = resource_spec_price.get("memory_size_gib", 1800)
+
+    # Create job via browser API
+    result = browser_api_module.create_job(
         name=name,
         command=final_command,
-        resource=resource,
         framework=framework,
-        prefer_location=location,
+        logic_compute_group_id=compute_group_id,
         project_id=project_id,
         workspace_id=workspace_id,
         image=image,
         image_type=image_type,
-        task_priority=priority,
         instance_count=nodes,
-        max_running_time_ms=max_time_ms,
+        gpu_count=gpu_count,
+        cpu_count=cpu_count,
+        mem_gi=mem_gi,
+        shm_gi=shm_gi,
+        resource_spec_price=resource_spec_price,
+        task_priority=priority,
+        session=session,
     )
 
-    if config.shm_size is not None:
-        shm_size = int(config.shm_size)
-        if shm_size < 1:
-            raise ValueError(
-                "Shared memory size must be >= 1 (set INSPIRE_SHM_SIZE or job.shm_size)."
-            )
-        create_kwargs["shm_gi"] = shm_size
-
-    result = api.create_training_job_smart(**create_kwargs)
     data = result.get("data", {}) if isinstance(result, dict) else {}
     job_id = data.get("job_id")
 
@@ -379,7 +422,6 @@ __all__ = [
     "build_remote_logged_command",
     "cache_created_job",
     "select_project_for_job",
-    "select_project_for_workspace",
     "submit_training_job",
     "wrap_in_bash",
 ]

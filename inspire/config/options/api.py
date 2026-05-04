@@ -70,15 +70,6 @@ API_OPTIONS: list[ConfigOption] = [
         scope="global",
     ),
     ConfigOption(
-        env_var="INSPIRE_OPENAPI_PREFIX",
-        toml_key="api.openapi_prefix",
-        field_name="openapi_prefix",
-        description="OpenAPI endpoint path prefix",
-        default=None,
-        category="API",
-        scope="global",
-    ),
-    ConfigOption(
         env_var="INSPIRE_BROWSER_API_PREFIX",
         toml_key="api.browser_api_prefix",
         field_name="browser_api_prefix",
@@ -103,6 +94,19 @@ API_OPTIONS: list[ConfigOption] = [
         description="Docker registry hostname",
         default=None,
         category="API",
+        scope="global",
+    ),
+]
+
+V2_OPTIONS: list[ConfigOption] = [
+    ConfigOption(
+        env_var="INSPIRE_V2_ENABLED",
+        toml_key="api.v2_enabled",
+        field_name="v2_enabled",
+        description="Enable v2 API with Bearer token auth (default: true)",
+        default=True,
+        category="API",
+        parser=_parse_bool,
         scope="global",
     ),
 ]

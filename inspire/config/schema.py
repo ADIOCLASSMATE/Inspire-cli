@@ -16,7 +16,7 @@ from inspire.config.schema_models import (  # noqa: F401
     _parse_int,
     parse_value,
 )
-from inspire.config.options.api import API_OPTIONS, AUTH_OPTIONS
+from inspire.config.options.api import API_OPTIONS, AUTH_OPTIONS, V2_OPTIONS
 from inspire.config.options.infra import PATHS_OPTIONS
 from inspire.config.options.project import (
     JOB_OPTIONS,
@@ -28,6 +28,7 @@ from inspire.config.options.project import (
 CONFIG_OPTIONS: list[ConfigOption] = [
     *AUTH_OPTIONS,
     *API_OPTIONS,
+    *V2_OPTIONS,
     *PATHS_OPTIONS,
     *WORKSPACES_OPTIONS,
     *JOB_OPTIONS,

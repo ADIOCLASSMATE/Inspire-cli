@@ -1,44 +1,7 @@
-"""Error types and helpers for the Inspire OpenAPI client."""
+"""Job ID format validation utilities (moved from openapi/errors.py)."""
 
 import re
 from typing import Optional
-
-
-class InspireAPIError(Exception):
-    """Inspire API base exception."""
-
-
-class AuthenticationError(InspireAPIError):
-    """Authentication failed exception."""
-
-
-class JobCreationError(InspireAPIError):
-    """Job creation failed exception."""
-
-
-class ValidationError(InspireAPIError):
-    """Input validation failed exception."""
-
-
-class JobNotFoundError(InspireAPIError):
-    """Job not found or invalid job ID"""
-
-
-API_ERROR_CODES = {
-    100002: "Parameter error - the job ID may be invalid, truncated, or the job no longer exists",
-    100001: "Authentication error",
-    100003: "Permission denied",
-    100004: "Resource not found",
-}
-
-
-def _translate_api_error(code: int, message: str) -> str:
-    """Translate API error code to a helpful message."""
-    hint = API_ERROR_CODES.get(code)
-    if hint:
-        return f"{message} ({hint})"
-    return message
-
 
 JOB_ID_PATTERN = re.compile(
     r"^job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE

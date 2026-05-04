@@ -1,7 +1,7 @@
 """CLI utility modules."""
 
 from inspire.config import Config, ConfigError
-from inspire.cli.utils.auth import AuthManager
-from inspire.platform.openapi import AuthenticationError
+# AuthManager and AuthenticationError were removed.
+# Use ``get_web_session()`` from ``inspire.platform.web.session`` instead.
 
-__all__ = ["Config", "ConfigError", "AuthManager", "AuthenticationError"]
+__all__ = ["Config", "ConfigError"]

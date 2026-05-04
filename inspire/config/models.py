@@ -49,8 +49,7 @@ class Config:
     skip_ssl_verify: bool = False
     force_proxy: bool = False
 
-    # API path prefixes (None = use code defaults)
-    openapi_prefix: Optional[str] = None
+    # API path prefix (None = use code default)
     browser_api_prefix: Optional[str] = None
     auth_endpoint: Optional[str] = None
     docker_registry: Optional[str] = None
@@ -111,6 +110,9 @@ class Config:
 
     # Source precedence: "env" (default) = env vars win, "toml" = project TOML wins
     prefer_source: str = "env"
+
+    # v2 API settings
+    v2_enabled: bool = True
 
     # Class-level config paths
     GLOBAL_CONFIG_PATH_ENV_VAR = "INSPIRE_GLOBAL_CONFIG_PATH"

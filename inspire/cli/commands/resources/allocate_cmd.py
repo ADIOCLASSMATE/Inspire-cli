@@ -19,8 +19,10 @@ from inspire.cli.formatters import json_formatter
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.platform.web.browser_api.availability.allocate import (
     AllocateResult,
+    GroupPreemptibility,
     ProjectBudget,
     compute_allocate_overview,
+    LOW_PRIORITY_THRESHOLD,
 )
 from inspire.platform.web.session import SessionExpiredError
 
@@ -38,9 +40,13 @@ def _format_human(result: AllocateResult) -> str:
     lines.append("")
     lines.append("Compute Groups:")
     lines.append("  available = idle GPUs ready to use")
-    lines.append("  low_pri   = GPUs running low-priority tasks (can be preempted by higher priority)")
+    lines.append(
+        f"  low_pri   = GPUs running low-priority tasks (priority <= {LOW_PRIORITY_THRESHOLD}, can be preempted)"
+    )
     lines.append("  [FREE]        = enough idle GPUs for the request, no preemption needed")
-    lines.append("  [PREEMPTIBLE] = not enough idle GPUs, but low_pri count suggests preemption may work")
+    lines.append(
+        "  [PREEMPTIBLE] = not enough idle GPUs, but low_pri count suggests preemption may work"
+    )
     lines.append("  [QUEUED]      = not enough idle or preemptible GPUs, must queue and wait")
     lines.append("-" * 72)
     for g in result.groups:
@@ -59,6 +65,45 @@ def _format_human(result: AllocateResult) -> str:
             f"total={g.total_gpus:>5}  "
             f"[{tag}]"
         )
+
+        # Show preemptibility detail for this group if available
+        pre = result.preemptibility.get(g.group_id)
+        if pre and pre.preemptible_nodes:
+            lines.append(
+                f"    {'':<20} fully_preemptible_nodes={pre.fully_preemptible_nodes}  "
+                f"partially_preemptible_nodes={pre.partially_preemptible_nodes}  "
+                f"mixed_node_low_pri_gpus={pre.preemptible_gpus_on_mixed_nodes}"
+            )
+            if pre.unschedulable_preemptible_nodes > 0:
+                lines.append(
+                    f"    {'':<20} unschedulable_nodes={pre.unschedulable_preemptible_nodes}  "
+                    f"unschedulable_low_pri_gpus={pre.unschedulable_preemptible_gpus}  "
+                    f"(status != Ready, cannot schedule new tasks)"
+                )
+            # Only show nodes that have low-priority tasks (skip noise)
+            for pn in pre.preemptible_nodes:
+                if pn.gpu_preemptible == 0:
+                    continue
+                if pn.is_fully_preemptible:
+                    label = "FULLY PREEMPTIBLE"
+                elif not pn.is_schedulable:
+                    label = f"SCHEDULING DISABLED ({pn.status})"
+                else:
+                    label = "mixed"
+                lines.append(
+                    f"      node={pn.node_name:<25} "
+                    f"gpu_total={pn.gpu_total}  "
+                    f"low_pri_gpu={pn.gpu_preemptible}  "
+                    f"other_gpu={pn.gpu_other}  "
+                    f"[{label}]"
+                )
+                for pt in pn.low_priority_tasks:
+                    lines.append(
+                        f"        task={pt.name:<30} "
+                        f"priority={pt.priority}  "
+                        f"user={pt.user:<15} "
+                        f"gpu={pt.gpu_used}"
+                    )
     lines.append("")
 
     # Projects
@@ -67,12 +112,7 @@ def _format_human(result: AllocateResult) -> str:
     for p in result.projects:
         budget_str = _format_budget(p)
         ws_col = f"workspace={p.workspace_name or p.workspace_id:<20} " if show_workspace else ""
-        lines.append(
-            f"  {p.project_name:<25} "
-            f"{ws_col}"
-            f"priority={p.priority:<3}  "
-            f"{budget_str}"
-        )
+        lines.append(f"  {p.project_name:<25} {ws_col}priority={p.priority:<3}  {budget_str}")
     lines.append("")
 
     return "\n".join(lines)
@@ -103,24 +143,29 @@ def _short_num(n: float) -> str:
 
 def _format_json(result: AllocateResult) -> str:
     """Format overview as JSON output."""
+    groups_data = []
+    for g in result.groups:
+        g_dict: dict = {
+            "id": g.group_id,
+            "name": g.group_name,
+            "gpu_type": g.gpu_type,
+            "workspace_id": g.workspace_id,
+            "workspace_name": g.workspace_name,
+            "available": g.available_gpus,
+            "low_priority": g.low_priority_gpus,
+            "total": g.total_gpus,
+            "has_free": g.has_free,
+            "has_preemptible": g.has_preemptible,
+        }
+        pre = result.preemptibility.get(g.group_id)
+        if pre:
+            g_dict["preemptibility"] = _preemptibility_to_dict(pre)
+        groups_data.append(g_dict)
+
     data = {
         "gpus": result.gpus,
         "gpu_type": result.gpu_type,
-        "groups": [
-            {
-                "id": g.group_id,
-                "name": g.group_name,
-                "gpu_type": g.gpu_type,
-                "workspace_id": g.workspace_id,
-                "workspace_name": g.workspace_name,
-                "available": g.available_gpus,
-                "low_priority": g.low_priority_gpus,
-                "total": g.total_gpus,
-                "has_free": g.has_free,
-                "has_preemptible": g.has_preemptible,
-            }
-            for g in result.groups
-        ],
+        "groups": groups_data,
         "projects": [
             {
                 "id": p.project_id,
@@ -138,15 +183,52 @@ def _format_json(result: AllocateResult) -> str:
     return json_formatter.format_json(data)
 
 
+def _preemptibility_to_dict(pre: GroupPreemptibility) -> dict:
+    """Convert GroupPreemptibility to a JSON-serializable dict."""
+    return {
+        "group_id": pre.group_id,
+        "group_name": pre.group_name,
+        "fully_preemptible_nodes": pre.fully_preemptible_nodes,
+        "partially_preemptible_nodes": pre.partially_preemptible_nodes,
+        "preemptible_gpus_on_mixed_nodes": pre.preemptible_gpus_on_mixed_nodes,
+        "unschedulable_preemptible_nodes": pre.unschedulable_preemptible_nodes,
+        "unschedulable_preemptible_gpus": pre.unschedulable_preemptible_gpus,
+        "nodes": [
+            {
+                "node_name": pn.node_name,
+                "gpu_total": pn.gpu_total,
+                "gpu_preemptible": pn.gpu_preemptible,
+                "gpu_other": pn.gpu_other,
+                "is_fully_preemptible": pn.is_fully_preemptible,
+                "is_schedulable": pn.is_schedulable,
+                "status": pn.status,
+                "low_priority_tasks": [
+                    {
+                        "id": pt.id,
+                        "name": pt.name,
+                        "priority": pt.priority,
+                        "user": pt.user,
+                        "gpu_used": pt.gpu_used,
+                    }
+                    for pt in pn.low_priority_tasks
+                ],
+            }
+            for pn in pre.preemptible_nodes
+        ],
+    }
+
+
 @click.command("allocate")
 @click.option(
-    "--gpus", "-g",
+    "--gpus",
+    "-g",
     type=int,
     default=8,
     help="Number of GPUs needed (default: 8)",
 )
 @click.option(
-    "--type", "gpu_type",
+    "--type",
+    "gpu_type",
     type=click.Choice(["H100", "H200"], case_sensitive=False),
     default="H200",
     help="GPU type (default: H200)",
@@ -169,9 +251,9 @@ def allocate(
       [PREEMPTIBLE] = not enough idle, but low_pri count suggests preemption may work
       [QUEUED]      = must queue and wait
 
-    Note: low_pri is an aggregate per-group number. Actual preemption depends on
-    whether low-pri tasks are concentrated on the same node, which this tool
-    cannot determine.
+    When preemptibility data is available, each PREEMPTIBLE group shows
+    per-node detail: which nodes have low-priority tasks, how many GPUs
+    they use, and whether the node is fully preemptible.
 
     \b
     Examples:

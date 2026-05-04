@@ -25,12 +25,13 @@ from inspire.cli.context import (
 )
 from inspire.cli.formatters import human_formatter, json_formatter
 from inspire.cli.utils import job_submit
-from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.compute_group_autoselect import find_best_compute_group_location
 from inspire.cli.utils.image_resolver import ImageNotFoundError, resolve_image, _looks_like_full_url
 from inspire.cli.utils.errors import exit_with_error as _handle_error
+from inspire.cli.utils.resource_parser import parse_resource_request
 from inspire.config import Config, ConfigError
 from inspire.config.workspaces import select_workspace_id
+from inspire.platform.web.session import SessionExpiredError
 
 
 def _get_current_branch() -> str | None:
@@ -49,24 +50,26 @@ def _get_current_branch() -> str | None:
 def _resolve_run_resource_and_location(
     ctx: Context,
     *,
-    api,  # noqa: ANN001
+    config: Config,
     gpus: int,
     gpu_type: str,
     location: str | None,
     nodes: int,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str]:
     if location:
-        return f"{gpus}x{gpu_type}", location
+        return f"{gpus}x{gpu_type}", location, ""
 
     if ctx.debug and not ctx.json_output:
         click.echo("Checking GPU availability...")
 
-    best, selected_location, selected_group_name = find_best_compute_group_location(
-        api,
-        gpu_type=gpu_type,
-        min_gpus=gpus,
-        include_preemptible=True,
-        instance_count=nodes,
+    best, selected_location, selected_group_name, selected_compute_group_id = (
+        find_best_compute_group_location(
+            gpu_type=gpu_type,
+            min_gpus=gpus,
+            include_preemptible=True,
+            instance_count=nodes,
+            config_compute_groups=config.compute_groups,
+        )
     )
 
     if not best:
@@ -92,7 +95,7 @@ def _resolve_run_resource_and_location(
         sys.exit(EXIT_VALIDATION_ERROR)
 
     resource_str = f"{gpus}x{gpu_type}"
-    location = selected_location or selected_group_name or None
+    final_location = selected_location or selected_group_name or None
 
     if ctx.debug and not ctx.json_output:
         if getattr(best, "selection_source", "") == "nodes" and getattr(best, "free_nodes", 0):
@@ -112,7 +115,7 @@ def _resolve_run_resource_and_location(
                 f"{best.available_gpus} GPUs available{preempt_note}"
             )
 
-    return resource_str, location
+    return resource_str, final_location, selected_compute_group_id
 
 
 def _run_flow(
@@ -135,7 +138,6 @@ def _run_flow(
 ) -> None:
     try:
         config, _ = Config.from_files_and_env(require_target_dir=True)
-        api = AuthManager.get_api(config)
 
         if priority is None:
             priority = config.job_priority
@@ -180,14 +182,25 @@ def _run_flow(
             )
             return
 
-        resource_str, location = _resolve_run_resource_and_location(
+        resource_str, location, compute_group_id = _resolve_run_resource_and_location(
             ctx,
-            api=api,
+            config=config,
             gpus=gpus,
             gpu_type=gpu_type,
             location=location,
             nodes=nodes,
         )
+
+        try:
+            requested_gpu_type, requested_gpu_count = parse_resource_request(resource_str)
+        except Exception as e:
+            _handle_error(
+                ctx,
+                "ValidationError",
+                f"Invalid resource spec: {e}",
+                EXIT_VALIDATION_ERROR,
+            )
+            return
 
         if not name:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -227,13 +240,11 @@ def _run_flow(
 
         try:
             submission = job_submit.submit_training_job(
-                api,
                 config=config,
                 name=name,
                 command=command,
                 resource=resource_str,
                 framework="pytorch",
-                location=location,
                 project_id=project_id,
                 workspace_id=job_workspace_id,
                 image=image,
@@ -241,6 +252,9 @@ def _run_flow(
                 priority=priority,
                 nodes=nodes,
                 max_time_hours=max_time,
+                gpu_type=requested_gpu_type.value,
+                gpu_count=requested_gpu_count,
+                compute_group_id=compute_group_id,
                 project_name=selected_project.name,
                 log_file=log_file,
             )
@@ -289,7 +303,7 @@ def _run_flow(
 
     except ConfigError as e:
         _handle_error(ctx, "ConfigError", str(e), EXIT_CONFIG_ERROR)
-    except AuthenticationError as e:
+    except SessionExpiredError as e:
         _handle_error(ctx, "AuthenticationError", str(e), EXIT_AUTH_ERROR)
     except Exception as e:
         _handle_error(ctx, "APIError", str(e), EXIT_GENERAL_ERROR)

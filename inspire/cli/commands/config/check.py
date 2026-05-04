@@ -17,7 +17,6 @@ from inspire.cli.context import (
     pass_context,
 )
 from inspire.cli.formatters import human_formatter, json_formatter
-from inspire.cli.utils.auth import AuthManager, AuthenticationError
 from inspire.cli.utils.errors import exit_with_error as _handle_error
 from inspire.config import (
     Config,
@@ -233,8 +232,11 @@ def check_config(ctx: Context, json_output_local: bool) -> None:
         auth_error = None
 
         try:
-            AuthManager.get_api(cfg)
-        except AuthenticationError as e:
+            from inspire.platform.web.session.models import WebSession
+            session = WebSession.load()
+            if not session or not session.storage_state.get("cookies"):
+                raise ValueError("No valid web session found. Run 'inspire init --discover' to log in.")
+        except (ValueError, OSError) as e:
             auth_ok = False
             auth_error = str(e)
 

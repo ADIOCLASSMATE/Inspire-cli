@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from inspire.platform.openapi import _validate_job_id_format
+from inspire.cli.utils.id_format import _validate_job_id_format
 from inspire.cli.context import Context, EXIT_JOB_NOT_FOUND
 from inspire.cli.utils.errors import exit_with_error
 from inspire.cli.utils.id_resolver import (
@@ -16,6 +16,11 @@ from inspire.cli.utils.id_resolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_job_prefix(jid: str) -> str:
+    """Remove the ``job-`` prefix from a job ID for comparison."""
+    return jid[4:] if jid.lower().startswith("job-") else jid
 
 
 def resolve_job_id(ctx: Context, job_id: str) -> str:
@@ -94,8 +99,7 @@ def _search_job_cache(partial: str) -> list[tuple[str, str]]:
     for job in jobs:
         jid = job.get("job_id", "")
         # Strip prefix for comparison
-        uuid_part = jid[4:] if jid.lower().startswith("job-") else jid
-        if uuid_part.lower().startswith(partial):
+        if _strip_job_prefix(jid).lower().startswith(partial):
             label = job.get("name") or job.get("status") or ""
             matches.append((jid, label))
     return matches
